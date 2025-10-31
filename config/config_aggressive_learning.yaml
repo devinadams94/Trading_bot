@@ -1,0 +1,133 @@
+# Enhanced Configuration for Aggressive Learning
+# Optimized for faster convergence and better exploration
+
+# Data Configuration
+data_source: "alpaca"  # or "simulated" for testing
+data_days: 60  # Increased data window
+cache_data: true
+use_real_data: true
+
+# Trading Symbols - Start with liquid ETFs
+symbols:
+  - SPY   # S&P 500 - Most liquid
+  - QQQ   # NASDAQ - High volume
+  - IWM   # Russell 2000 - Good volatility
+
+# Training Parameters - Optimized for Learning
+num_episodes: 5000  # Increased for better convergence
+episode_length: 195  # Half trading day for faster episodes
+batch_size: 128     # Increased for better gradient estimates
+n_epochs: 15        # More training per batch
+
+# Enhanced Model Parameters
+learning_rate: 1e-3        # Increased for faster learning
+clstm_learning_rate: 3e-3  # Much higher for CLSTM adaptation
+gamma: 0.95                # Slightly lower for shorter-term focus
+clip_epsilon: 0.3          # Increased for more exploration
+value_coef: 1.0           # Higher value learning
+entropy_coef: 0.05        # Much higher for exploration
+max_grad_norm: 1.0        # Allow larger gradients
+
+# Exploration and Risk Parameters
+initial_capital: 100000
+max_positions: 5          # Reduced for focused learning
+position_size_pct: 0.1   # 10% per position
+risk_free_rate: 0.05
+transaction_cost: 0.001   # $1 per $1000
+
+# Reward Engineering
+reward_scaling: 10.0      # Scale rewards for better learning
+profit_bonus: 2.0         # Bonus for profitable trades
+loss_penalty: 1.0         # Penalty for losses
+trade_frequency_bonus: 0.1 # Encourage trading
+risk_penalty: 0.5         # Penalize excessive risk
+
+# Learning Schedule
+warmup_episodes: 100      # Episodes before serious training
+exploration_decay: 0.995  # Gradual exploration reduction
+min_exploration: 0.1      # Minimum exploration rate
+
+# Data Quality Thresholds (Relaxed for Learning)
+min_data_quality: 0.3     # Lowered threshold
+min_volume_threshold: 1000 # Reduced volume requirement
+max_spread_threshold: 0.05 # 5% max spread
+
+# Pre-training Configuration
+pretrain_epochs: 100      # More pre-training
+pretrain_lr: 5e-3        # Higher pre-training learning rate
+use_supervised_pretraining: true
+supervised_data_ratio: 0.3
+
+# Advanced Training Features
+use_curriculum_learning: true
+curriculum_stages: 3
+stage_1_episodes: 500    # Conservative trading
+stage_2_episodes: 1500   # Moderate risk
+stage_3_episodes: 3000   # Full complexity
+
+# Experience Replay
+buffer_size: 50000       # Large replay buffer
+min_buffer_size: 1000    # Start training early
+replay_ratio: 0.25      # 25% replay vs new experience
+
+# Regularization
+dropout_rate: 0.1        # Light dropout
+weight_decay: 1e-5       # Light weight decay
+gradient_noise: 0.01     # Add noise for exploration
+
+# GPU Configuration
+use_multi_gpu: true
+gpu_memory_fraction: 0.9
+mixed_precision: false
+
+# Monitoring and Logging
+save_frequency: 50       # Save more frequently
+eval_frequency: 25       # Evaluate more often
+log_frequency: 10        # Log every 10 episodes
+checkpoint_dir: "checkpoints/aggressive_learning"
+auto_resume: true
+
+# Debugging and Analysis
+debug_mode: true         # Enable detailed logging
+save_episode_data: true  # Save episode details
+analyze_actions: true    # Analyze action distribution
+track_gradients: true    # Monitor gradient flow
+
+# Logging
+log_wandb: true
+wandb_project: "aggressive-options-learning"
+wandb_tags: ["aggressive", "enhanced", "multi-gpu"]
+
+# Environment Settings
+render_mode: false       # No visualization during training
+seed: 42                # Reproducible results
+deterministic: false    # Allow randomness for exploration
+
+# Action Space Configuration
+action_space_type: "continuous"  # or "discrete"
+num_discrete_actions: 31        # If using discrete
+action_scaling: 1.0             # Scale continuous actions
+
+# Observation Space
+include_technical_indicators: true
+include_market_microstructure: true
+include_sentiment_data: false     # Disable if not available
+lookback_window: 20              # Days of historical data
+
+# Risk Management
+max_drawdown: 0.2        # 20% max drawdown
+stop_loss: 0.05         # 5% stop loss
+take_profit: 0.15       # 15% take profit
+max_leverage: 2.0       # 2x max leverage
+
+# Market Hours
+market_open: "09:30"
+market_close: "16:00"
+timezone: "US/Eastern"
+
+# Data Validation
+validate_data: true
+fix_missing_data: true
+interpolate_gaps: true
+remove_outliers: true
+outlier_threshold: 3.0   # 3 standard deviations

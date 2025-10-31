@@ -1,0 +1,95 @@
+# Configuration for training with real historical options data
+
+# API Settings
+alpaca_base_url: "https://paper-api.alpaca.markets"
+alpaca_data_url: "https://data.alpaca.markets"
+
+# Data Settings
+use_real_data: true
+data_days: 60  # Days of historical data to load
+cache_data: true  # Cache historical data to avoid repeated API calls
+
+# Trading Symbols
+# Leave empty to use defaults from symbols_config.yaml
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+# Or override with specific symbols:
+# symbols:
+#   - TSLA
+#   - NVDA
+#   - AMD
+
+# Training Parameters
+num_episodes: 1000
+episode_length: 390  # Full trading day (6.5 hours * 60 minutes)
+batch_size: 64
+n_epochs: 10
+
+# Model Parameters
+learning_rate: 3e-4
+clstm_learning_rate: 1e-3
+gamma: 0.99
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+max_grad_norm: 0.5
+
+# GPU Configuration
+use_multi_gpu: true  # Enable multi-GPU training if available
+gpu_memory_fraction: 0.9  # Fraction of GPU memory to use
+mixed_precision: false  # Enable mixed precision training (experimental)
+
+# Pre-training
+pretrain_epochs: 50
+pretrain_samples: 5000
+
+# Portfolio Settings
+initial_capital: 100000
+max_positions: 10
+position_size_limit: 0.1  # 10% of capital per position
+min_capital_per_trade: 1000
+max_capital_per_trade: 10000
+commission: 0.65  # Per option contract
+
+# Risk Management
+max_daily_loss: 5000
+max_drawdown: 0.3  # 30%
+daily_trade_limit: 50
+
+# Checkpointing
+save_frequency: 100  # Save checkpoint every N episodes (increased for better performance)
+eval_frequency: 10
+checkpoint_dir: "checkpoints/options_real_data"
+auto_resume: true  # Automatically resume from latest checkpoint
+
+# Logging
+log_wandb: false
+wandb_project: "options-real-data-training"
+
+# Backtesting
+backtest_start_date: "2024-01-01"
+backtest_end_date: "2024-06-30"
+backtest_commission: 0.65
+
+# Options Data Settings
+options_expiry_range: [7, 42]  # Days to expiry range
+options_strike_range: 0.2  # +/- 20% from current price
+min_option_volume: 10
+max_days_to_expiry: 45
+
+# Technical Indicators
+use_technical_indicators: true
+indicators:
+  - sma_5
+  - sma_20
+  - rsi_14
+  - volatility_20
+  - volume_ratio
+
+# Greeks Thresholds
+max_portfolio_delta: 100
+max_portfolio_gamma: 50
+max_portfolio_vega: 1000
+theta_decay_threshold: -100

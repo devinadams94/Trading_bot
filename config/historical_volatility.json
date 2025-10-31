@@ -1,0 +1,42 @@
+{
+  "overall_mean_volatility": 0.17566732263265405,
+  "symbol_volatilities": {
+    "SPY": {
+      "mean_volatility": 0.1396375185761319,
+      "median_volatility": 0.15327461485507216,
+      "std_volatility": 0.05064806332561977,
+      "min_volatility": 0.05391255626706121,
+      "max_volatility": 0.2180423517613774,
+      "sample_size": 24
+    },
+    "QQQ": {
+      "mean_volatility": 0.08235051997920773,
+      "median_volatility": 0.08314569286897236,
+      "std_volatility": 0.02414365396134026,
+      "min_volatility": 0.051552397964838396,
+      "max_volatility": 0.15944899735912757,
+      "sample_size": 31
+    },
+    "AAPL": {
+      "mean_volatility": 0.14832115665990997,
+      "median_volatility": 0.10881523139084749,
+      "std_volatility": 0.09706712457895934,
+      "min_volatility": 0.035752203475584325,
+      "max_volatility": 0.35938221311487684,
+      "sample_size": 26
+    },
+    "TSLA": {
+      "mean_volatility": 0.3323600953153666,
+      "median_volatility": 0.2969636798893145,
+      "std_volatility": 0.12101111487530317,
+      "min_volatility": 0.10724668682659678,
+      "max_volatility": 0.6320377305484257,
+      "sample_size": 34
+    }
+  },
+  "recommended_settings": {
+    "option_price_mean_change": 0.017566732263265408,
+    "option_price_volatility": 0.17566732263265405,
+    "atm_multiplier": 1.5
+  }
+}
