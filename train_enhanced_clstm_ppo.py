@@ -684,7 +684,11 @@ class EnhancedCLSTMPPOTrainer:
         obs = self.env.reset()
         total_reward = 0
         episode_length = 0
-        
+
+        # Track training updates for this episode
+        episode_ppo_losses = []
+        episode_clstm_losses = []
+
         # Collect episode data
         episode_observations = []
         episode_actions = []
@@ -786,9 +790,15 @@ class EnhancedCLSTMPPOTrainer:
             logger.debug(f"Train result: {train_result}")
             if train_result:
                 # FIXED: Use correct keys from train() return dict
-                self.clstm_losses.append(train_result.get('clstm_loss', 0.0))
-                self.ppo_losses.append(train_result.get('total_loss', 0.0))  # Changed from 'ppo_loss' to 'total_loss'
-                logger.info(f"✅ Training update: PPO loss={train_result.get('total_loss', 0.0):.4f}, CLSTM loss={train_result.get('clstm_loss', 0.0):.4f}")
+                ppo_loss = train_result.get('total_loss', 0.0)
+                clstm_loss = train_result.get('clstm_loss', 0.0)
+
+                self.clstm_losses.append(clstm_loss)
+                self.ppo_losses.append(ppo_loss)
+
+                # Track losses for this episode (for aggregated reporting)
+                episode_ppo_losses.append(ppo_loss)
+                episode_clstm_losses.append(clstm_loss)
             else:
                 logger.warning(f"⚠️ Training returned empty result (buffer size: {buffer_size})")
         
@@ -824,7 +834,9 @@ class EnhancedCLSTMPPOTrainer:
             'portfolio_value': portfolio_value,
             'episode_length': episode_length,
             'win_rate': win_rate,
-            'profitable_trades': profitable_trades
+            'profitable_trades': profitable_trades,
+            'episode_ppo_losses': episode_ppo_losses,
+            'episode_clstm_losses': episode_clstm_losses
         }
     
     async def train(self, num_episodes: int = None):
@@ -875,29 +887,87 @@ class EnhancedCLSTMPPOTrainer:
                     return_std = np.std(recent_returns) if len(recent_returns) > 1 else 1.0
                     sharpe_ratio = avg_return / max(return_std, 0.001)
 
-                    avg_clstm_loss = np.mean(self.clstm_losses[-10:]) if len(self.clstm_losses) >= 10 else 0
-                    avg_ppo_loss = np.mean(self.ppo_losses[-10:]) if len(self.ppo_losses) >= 10 else 0
+                    # Calculate aggregated loss statistics for this episode
+                    episode_ppo_losses = metrics.get('episode_ppo_losses', [])
+                    episode_clstm_losses = metrics.get('episode_clstm_losses', [])
 
-                    logger.info(
-                        f"Episode {self.episode:4d}: "
-                        f"Return: {metrics['portfolio_return']:7.4f}, "
-                        f"Trades: {metrics['episode_trades']:2d}, "
-                        f"WinRate: {metrics['win_rate']:5.1%}, "
-                        f"AvgRet: {avg_return:6.4f}, "
-                        f"ProfRate: {profitability_rate:5.1%}, "
-                        f"Sharpe: {sharpe_ratio:5.2f}, "
-                        f"Best: {self.best_performance:.4f}"
-                    )
+                    if episode_ppo_losses and episode_clstm_losses:
+                        avg_episode_ppo = np.mean(episode_ppo_losses)
+                        avg_episode_clstm = np.mean(episode_clstm_losses)
+                        num_updates = len(episode_ppo_losses)
+
+                        # Determine loss trend and performance indicator
+                        ppo_indicator = ""
+                        clstm_indicator = ""
+                        if len(self.ppo_losses) >= 50:
+                            recent_ppo_avg = np.mean(self.ppo_losses[-50:])
+                            recent_clstm_avg = np.mean(self.clstm_losses[-50:])
+
+                            # PPO loss: Lower is better for convergence
+                            if avg_episode_ppo < recent_ppo_avg * 0.85:
+                                ppo_indicator = "📉 Excellent"
+                            elif avg_episode_ppo < recent_ppo_avg * 0.95:
+                                ppo_indicator = "✅ Good"
+                            elif avg_episode_ppo < recent_ppo_avg * 1.05:
+                                ppo_indicator = "➡️  Stable"
+                            elif avg_episode_ppo < recent_ppo_avg * 1.15:
+                                ppo_indicator = "⚠️  Rising"
+                            else:
+                                ppo_indicator = "❌ High"
+
+                            # CLSTM loss: Lower is better
+                            if avg_episode_clstm < recent_clstm_avg * 0.85:
+                                clstm_indicator = "📉 Excellent"
+                            elif avg_episode_clstm < recent_clstm_avg * 0.95:
+                                clstm_indicator = "✅ Good"
+                            elif avg_episode_clstm < recent_clstm_avg * 1.05:
+                                clstm_indicator = "➡️  Stable"
+                            elif avg_episode_clstm < recent_clstm_avg * 1.15:
+                                clstm_indicator = "⚠️  Rising"
+                            else:
+                                clstm_indicator = "❌ High"
+                        else:
+                            # Not enough history yet
+                            ppo_indicator = "🔄 Learning"
+                            clstm_indicator = "🔄 Learning"
+
+                        logger.info(
+                            f"Episode {self.episode:4d}: "
+                            f"Return: {metrics['portfolio_return']:7.4f}, "
+                            f"Trades: {metrics['episode_trades']:2d}, "
+                            f"WinRate: {metrics['win_rate']:5.1%}, "
+                            f"AvgRet: {avg_return:6.4f}, "
+                            f"ProfRate: {profitability_rate:5.1%}, "
+                            f"Sharpe: {sharpe_ratio:5.2f}"
+                        )
+                        logger.info(
+                            f"         Training ({num_updates} updates): "
+                            f"PPO: {avg_episode_ppo:.4f} {ppo_indicator} | "
+                            f"CLSTM: {avg_episode_clstm:.4f} {clstm_indicator}"
+                        )
+                    else:
+                        logger.info(
+                            f"Episode {self.episode:4d}: "
+                            f"Return: {metrics['portfolio_return']:7.4f}, "
+                            f"Trades: {metrics['episode_trades']:2d}, "
+                            f"WinRate: {metrics['win_rate']:5.1%}, "
+                            f"AvgRet: {avg_return:6.4f}, "
+                            f"ProfRate: {profitability_rate:5.1%}, "
+                            f"Sharpe: {sharpe_ratio:5.2f}"
+                        )
 
                     # Additional detailed logging every 100 episodes
                     if local_episode % 100 == 0 and local_episode > 0:
+                        avg_clstm_loss = np.mean(self.clstm_losses[-100:]) if len(self.clstm_losses) >= 100 else np.mean(self.clstm_losses) if self.clstm_losses else 0
+                        avg_ppo_loss = np.mean(self.ppo_losses[-100:]) if len(self.ppo_losses) >= 100 else np.mean(self.ppo_losses) if self.ppo_losses else 0
+
                         logger.info(f"📊 Detailed Stats (Last {window} episodes):")
                         logger.info(f"   Avg Return: {avg_return:.4f} ± {return_std:.4f}")
                         logger.info(f"   Avg Trades: {avg_trades:.1f}")
                         logger.info(f"   Avg Win Rate: {avg_win_rate:.1%}")
                         logger.info(f"   Profitable Episodes: {positive_episodes}/{window} ({profitability_rate:.1%})")
-                        logger.info(f"   CLSTM Loss: {avg_clstm_loss:.4f}")
-                        logger.info(f"   PPO Loss: {avg_ppo_loss:.4f}")
+                        logger.info(f"   Avg CLSTM Loss (100 eps): {avg_clstm_loss:.4f}")
+                        logger.info(f"   Avg PPO Loss (100 eps): {avg_ppo_loss:.4f}")
 
             # Check for consistent profitability milestone
             if local_episode >= 100 and local_episode % 100 == 0:

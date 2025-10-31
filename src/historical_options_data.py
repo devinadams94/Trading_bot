@@ -1,3 +1,5 @@
+import pandas as pd
+
 try:
     import alpaca_trade_api as tradeapi
     from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
@@ -10,9 +12,26 @@ except ImportError:
     warnings.warn("Alpaca packages not available, using mock implementations", ImportWarning)
 
     # Mock classes for testing
+    class MockBarsResponse:
+        """Mock response for bars data"""
+        def __init__(self):
+            self.df = pd.DataFrame()
+
     class MockAlpacaClient:
         def __init__(self, *args, **kwargs):
             pass
+
+        def get_stock_bars(self, request):
+            """Mock method that returns empty bars"""
+            return MockBarsResponse()
+
+        def get_option_bars(self, request):
+            """Mock method that returns empty bars"""
+            return MockBarsResponse()
+
+        def get_option_chain(self, request):
+            """Mock method that returns empty option chain"""
+            return MockBarsResponse()
 
     tradeapi = type('MockTradeAPI', (), {'REST': MockAlpacaClient})()
     StockHistoricalDataClient = MockAlpacaClient
@@ -21,7 +40,6 @@ except ImportError:
     OptionBarsRequest = MockAlpacaClient
     OptionChainRequest = MockAlpacaClient
     TimeFrame = type('MockTimeFrame', (), {'Hour': '1Hour', 'Day': '1Day'})()
-import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime, timedelta
