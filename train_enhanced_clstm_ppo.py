@@ -1114,15 +1114,17 @@ class EnhancedCLSTMPPOTrainer:
 
             # Get action from CLSTM-PPO agent (if not overridden by turbulence)
             if 'action' not in locals():
-                # EXPLORATION: Use epsilon-greedy for first 20% of episodes to encourage exploration
+                # EXPLORATION: Use epsilon-greedy for first 50% of episodes to encourage exploration
                 # Use config num_episodes for epsilon decay calculation
                 total_episodes = self.config.get('num_episodes', 1000)
-                epsilon = max(0.0, 0.3 * (1.0 - self.episode / (total_episodes * 0.2)))
+                # More aggressive exploration: 50% random in episode 1, decaying to 0% at 50% of training
+                epsilon = max(0.0, 0.5 * (1.0 - self.episode / (total_episodes * 0.5)))
                 use_random_action = (np.random.random() < epsilon)
 
                 if use_random_action:
                     # Random exploration - sample uniformly from action space
-                    action = np.random.randint(0, self.env.action_space.n)
+                    # BIAS AWAY FROM HOLD: Sample from actions 1-90 (exclude action 0)
+                    action = np.random.randint(1, self.env.action_space.n)
                     # Still get log_prob and value from model for training
                     if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
                         _, info = self.agent.act(obs)
@@ -1696,7 +1698,7 @@ async def main():
         'data_days': args.data_days,  # Pass data_days to config
         'learning_rate_actor_critic': 1e-3,
         'learning_rate_clstm': 3e-3,
-        'entropy_coef': 0.1,  # INCREASED: Higher exploration (was 0.05)
+        'entropy_coef': 0.2,  # INCREASED: Much higher exploration for trading (was 0.05, then 0.1)
         'include_technical_indicators': True,
         'include_market_microstructure': True,
         # NEW: Enable realistic transaction costs
