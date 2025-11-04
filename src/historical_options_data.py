@@ -499,9 +499,21 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 # Check cache first
                 if use_cache and self._is_cache_valid(cache_key) and os.path.exists(cache_path):
+                    msg = f"  [{idx}/{total_symbols}] 💾 Loading {sym} options from cache..."
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
                     with open(cache_path, 'rb') as f:
                         symbol_data = pickle.load(f)
-                    logger.info(f"  [{idx}/{total_symbols}] ✅ {sym} options loaded from cache ({len(symbol_data)} contracts)")
+
+                    msg = f"  [{idx}/{total_symbols}] ✅ {sym} options loaded from cache ({len(symbol_data)} contracts)"
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
                     result[sym] = symbol_data
                     continue
 
@@ -510,20 +522,47 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 if self.has_options_data and sym in stock_data:
                     # Try to fetch real options data
+                    msg = f"  [{idx}/{total_symbols}] 🌐 Attempting to fetch real options data for {sym}..."
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
                     try:
                         symbol_data = await self._fetch_real_options_data(
                             sym, start_date, end_date, stock_data[sym]
                         )
+
+                        msg = f"  [{idx}/{total_symbols}] ✅ Fetched {len(symbol_data)} real options contracts for {sym}"
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
                     except Exception as e:
-                        logger.warning(f"Failed to fetch real options data for {sym}: {e}")
+                        msg = f"  [{idx}/{total_symbols}] ⚠️ Failed to fetch real options data for {sym}: {e}"
+                        print(msg, flush=True)
+                        logger.warning(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
                         symbol_data = []
 
                 # Fall back to simulated data if real data unavailable
                 if not symbol_data and sym in stock_data:
-                    logger.info(f"  [{idx}/{total_symbols}] 🔄 Generating simulated options for {sym}...")
+                    msg = f"  [{idx}/{total_symbols}] 🔄 Generating simulated options for {sym}..."
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
                     symbol_data = await self._generate_simulated_options_data(
                         sym, start_date, end_date, stock_data[sym]
                     )
+
+                    msg = f"  [{idx}/{total_symbols}] ✅ Generated {len(symbol_data)} simulated options for {sym}"
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
 
                 if symbol_data:
                     # Validate data quality
@@ -574,6 +613,12 @@ class OptimizedHistoricalOptionsDataLoader:
 
         try:
             # Get options chain for the symbol
+            msg = f"      🔧 Creating options chain request for {symbol}..."
+            print(msg, flush=True)
+            logger.debug(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
             chain_request = OptionChainRequest(
                 underlying_symbol=symbol,
                 expiration_date_gte=start_date.date(),
@@ -581,26 +626,62 @@ class OptimizedHistoricalOptionsDataLoader:
             )
 
             # Use async rate limiting to not block event loop
+            msg = f"      ⏳ Rate limiting before API call..."
+            print(msg, flush=True)
+            logger.debug(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
             await self._rate_limit_async()
 
             # Log the request details for debugging
-            logger.debug(f"Fetching options chain for {symbol} from {start_date.date()} to {(end_date + timedelta(days=45)).date()}")
+            msg = f"      🌐 Calling Alpaca Options API for {symbol}..."
+            print(msg, flush=True)
+            logger.debug(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
 
             try:
                 # Run blocking API call in thread pool
                 options_chain = await asyncio.to_thread(self.options_data_client.get_option_chain, chain_request)
+
+                msg = f"      📦 Received options chain response for {symbol}"
+                print(msg, flush=True)
+                logger.debug(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
             except Exception as api_error:
-                logger.error(f"API error fetching options chain for {symbol}: {type(api_error).__name__}: {api_error}")
-                logger.info(f"Falling back to simulated data for {symbol}")
+                msg = f"      ❌ API error fetching options chain for {symbol}: {type(api_error).__name__}: {api_error}"
+                print(msg, flush=True)
+                logger.error(msg)
+
+                msg = f"      🔄 Falling back to simulated data for {symbol}"
+                print(msg, flush=True)
+                logger.info(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
                 return []
 
             # Check if options_chain is valid
             if not options_chain:
-                logger.warning(f"No options chain data returned from API for {symbol}")
-                logger.info(f"This may be due to: 1) Demo API keys, 2) No options available for this symbol, 3) API permissions")
+                msg = f"      ⚠️ No options chain data returned from API for {symbol}"
+                print(msg, flush=True)
+                logger.warning(msg)
+
+                msg = f"      💡 This may be due to: 1) Demo API keys, 2) No options available, 3) API permissions"
+                print(msg, flush=True)
+                logger.info(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
                 return []
 
             # Convert to list - Alpaca returns dict with option symbols as keys
+            msg = f"      🔄 Processing options chain for {symbol}..."
+            print(msg, flush=True)
+            logger.debug(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
             chain_list = []
 
             logger.debug(f"Options chain type: {type(options_chain)}")
@@ -734,6 +815,12 @@ class OptimizedHistoricalOptionsDataLoader:
         stock_data: pd.DataFrame
     ) -> List[Dict]:
         """Generate realistic simulated options data based on stock data"""
+        msg = f"      🎲 Generating simulated options data for {symbol}..."
+        print(msg, flush=True)
+        logger.debug(msg)
+        sys.stdout.flush()
+        sys.stderr.flush()
+
         options_data = []
 
         current_date = start_date
@@ -764,6 +851,12 @@ class OptimizedHistoricalOptionsDataLoader:
                         options_data.append(option_data)
 
             current_date += timedelta(days=1)
+
+        msg = f"      ✅ Generated {len(options_data)} simulated options for {symbol}"
+        print(msg, flush=True)
+        logger.debug(msg)
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         return options_data
 
