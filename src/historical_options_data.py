@@ -282,15 +282,16 @@ class OptimizedHistoricalOptionsDataLoader:
         result = {}
         total_symbols = len(symbols)
 
-        logger.info(f"📊 Loading stock data for {total_symbols} symbols...")
-        logger.info(f"   Date range: {start_date.date()} to {end_date.date()}")
-        logger.info(f"   Timeframe: {timeframe}")
-        logger.info(f"")
+        msg = f"📊 Loading stock data for {total_symbols} symbols...\n   Date range: {start_date.date()} to {end_date.date()}\n   Timeframe: {timeframe}\n"
+        print(msg, flush=True)
+        logger.info(msg)
         sys.stdout.flush()
         sys.stderr.flush()
 
         for idx, symbol in enumerate(symbols, 1):
-            logger.info(f"  [{idx}/{total_symbols}] 📥 Downloading {symbol}...")
+            msg = f"  [{idx}/{total_symbols}] 📥 Downloading {symbol}..."
+            print(msg, flush=True)
+            logger.info(msg)
             sys.stdout.flush()
             sys.stderr.flush()
             try:
@@ -299,19 +300,27 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 # Check cache first
                 if self._is_cache_valid(cache_key) and os.path.exists(cache_path):
-                    logger.info(f"  [{idx}/{total_symbols}] 💾 Loading {symbol} from cache...")
+                    msg = f"  [{idx}/{total_symbols}] 💾 Loading {symbol} from cache..."
+                    print(msg, flush=True)
+                    logger.info(msg)
                     sys.stdout.flush()
                     sys.stderr.flush()
+
                     with open(cache_path, 'rb') as f:
                         data = pickle.load(f)
-                    logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (cached)")
+
+                    msg = f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (cached)"
+                    print(msg, flush=True)
+                    logger.info(msg)
                     sys.stdout.flush()
                     sys.stderr.flush()
                     result[symbol] = data
                     continue
 
                 # Fetch from API
-                logger.info(f"  [{idx}/{total_symbols}] 🌐 Calling Alpaca API for {symbol}...")
+                msg = f"  [{idx}/{total_symbols}] 🌐 Calling Alpaca API for {symbol}..."
+                print(msg, flush=True)
+                logger.info(msg)
                 sys.stdout.flush()
                 sys.stderr.flush()
 
@@ -325,22 +334,32 @@ class OptimizedHistoricalOptionsDataLoader:
                 )
 
                 # Run blocking API call in thread pool to not block event loop
-                logger.info(f"  [{idx}/{total_symbols}] ⏳ Waiting for API response...")
+                msg = f"  [{idx}/{total_symbols}] ⏳ Waiting for API response..."
+                print(msg, flush=True)
+                logger.info(msg)
                 sys.stdout.flush()
                 sys.stderr.flush()
+
                 bars = await asyncio.to_thread(self.stock_data_client.get_stock_bars, request)
-                logger.info(f"  [{idx}/{total_symbols}] 📦 Received API response for {symbol}")
+
+                msg = f"  [{idx}/{total_symbols}] 📦 Received API response for {symbol}"
+                print(msg, flush=True)
+                logger.info(msg)
                 sys.stdout.flush()
                 sys.stderr.flush()
 
                 if bars.df.empty:
-                    logger.warning(f"  [{idx}/{total_symbols}] ⚠️ {symbol}: No data returned from API")
+                    msg = f"  [{idx}/{total_symbols}] ⚠️ {symbol}: No data returned from API"
+                    print(msg, flush=True)
+                    logger.warning(msg)
                     sys.stdout.flush()
                     sys.stderr.flush()
                     continue
 
                 # Process and validate data
-                logger.info(f"  [{idx}/{total_symbols}] 🔄 Processing {len(bars.df)} bars for {symbol}...")
+                msg = f"  [{idx}/{total_symbols}] 🔄 Processing {len(bars.df)} bars for {symbol}..."
+                print(msg, flush=True)
+                logger.info(msg)
                 sys.stdout.flush()
                 sys.stderr.flush()
 
@@ -351,15 +370,21 @@ class OptimizedHistoricalOptionsDataLoader:
                 quality_metrics = self._validate_data_quality(data, f"{symbol}_stock")
 
                 if quality_metrics.quality_score < 0.3:
-                    logger.warning(f"  [{idx}/{total_symbols}] ⚠️ {symbol}: Low quality ({quality_metrics.quality_score:.2f})")
+                    msg = f"  [{idx}/{total_symbols}] ⚠️ {symbol}: Low quality ({quality_metrics.quality_score:.2f})"
+                    print(msg, flush=True)
+                    logger.warning(msg)
                 else:
-                    logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (quality: {quality_metrics.quality_score:.2f})")
+                    msg = f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (quality: {quality_metrics.quality_score:.2f})"
+                    print(msg, flush=True)
+                    logger.info(msg)
 
                 sys.stdout.flush()
                 sys.stderr.flush()
 
                 # Cache the data
-                logger.info(f"  [{idx}/{total_symbols}] 💾 Caching {symbol} data...")
+                msg = f"  [{idx}/{total_symbols}] 💾 Caching {symbol} data..."
+                print(msg, flush=True)
+                logger.info(msg)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 with open(cache_path, 'wb') as f:
@@ -378,19 +403,31 @@ class OptimizedHistoricalOptionsDataLoader:
 
             except Exception as e:
                 error_msg = str(e)
-                logger.error(f"  [{idx}/{total_symbols}] ❌ {symbol}: {type(e).__name__}: {error_msg}")
+                msg = f"  [{idx}/{total_symbols}] ❌ {symbol}: {type(e).__name__}: {error_msg}"
+                print(msg, flush=True)
+                logger.error(msg)
 
                 # Provide helpful context for common errors
                 if "401" in error_msg or "Unauthorized" in error_msg:
-                    logger.error(f"  [{idx}/{total_symbols}] 🔑 API authentication failed - check your API keys")
+                    msg = f"  [{idx}/{total_symbols}] 🔑 API authentication failed - check your API keys"
+                    print(msg, flush=True)
+                    logger.error(msg)
                 elif "403" in error_msg or "Forbidden" in error_msg:
-                    logger.error(f"  [{idx}/{total_symbols}] 🚫 API access forbidden - check your subscription/permissions")
+                    msg = f"  [{idx}/{total_symbols}] 🚫 API access forbidden - check your subscription/permissions"
+                    print(msg, flush=True)
+                    logger.error(msg)
                 elif "429" in error_msg or "rate limit" in error_msg.lower():
-                    logger.error(f"  [{idx}/{total_symbols}] ⏱️ Rate limit exceeded - waiting before retry...")
+                    msg = f"  [{idx}/{total_symbols}] ⏱️ Rate limit exceeded - waiting before retry..."
+                    print(msg, flush=True)
+                    logger.error(msg)
                 elif "timeout" in error_msg.lower():
-                    logger.error(f"  [{idx}/{total_symbols}] ⏰ API request timed out")
+                    msg = f"  [{idx}/{total_symbols}] ⏰ API request timed out"
+                    print(msg, flush=True)
+                    logger.error(msg)
                 elif "connection" in error_msg.lower():
-                    logger.error(f"  [{idx}/{total_symbols}] 🌐 Network connection error")
+                    msg = f"  [{idx}/{total_symbols}] 🌐 Network connection error"
+                    print(msg, flush=True)
+                    logger.error(msg)
 
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -1265,15 +1302,11 @@ class OptimizedHistoricalOptionsDataLoader:
         """
         total_symbols = len(symbols)
         days = (end_date - start_date).days
-        logger.info(f"")
-        logger.info(f"{'='*80}")
-        logger.info(f"📊 DATA LOADING STARTED")
-        logger.info(f"{'='*80}")
-        logger.info(f"  Symbols: {total_symbols}")
-        logger.info(f"  Date range: {start_date.date()} to {end_date.date()} ({days} days)")
-        logger.info(f"  Estimated time: {2 if days < 180 else 5 if days < 365 else 15}-{5 if days < 180 else 15 if days < 365 else 30} minutes")
-        logger.info(f"{'='*80}")
-        logger.info(f"")
+
+        # Use print for immediate unbuffered output
+        msg = f"\n{'='*80}\n📊 DATA LOADING STARTED\n{'='*80}\n  Symbols: {total_symbols}\n  Date range: {start_date.date()} to {end_date.date()} ({days} days)\n  Estimated time: {2 if days < 180 else 5 if days < 365 else 15}-{5 if days < 180 else 15 if days < 365 else 30} minutes\n{'='*80}\n"
+        print(msg, flush=True)
+        logger.info(msg)
         sys.stdout.flush()
         sys.stderr.flush()
 
@@ -1281,7 +1314,11 @@ class OptimizedHistoricalOptionsDataLoader:
 
         try:
             # First, try to load stock data (more reliable and always available)
-            logger.info("📈 STEP 1/2: Loading stock data...")
+            msg = "📈 STEP 1/2: Loading stock data..."
+            print(msg, flush=True)
+            logger.info(msg)
+            sys.stdout.flush()
+
             stock_data = await self.load_historical_stock_data(
                 symbols=symbols,
                 start_date=start_date,
