@@ -364,11 +364,28 @@ class EnhancedCLSTMPPOTrainer:
         await self.env.load_data(start_date, end_date)
 
         if self.is_main_process:
-            logger.info(f"✅ Environment initialized with {len(self.env.symbols)} symbols")
-            logger.info(f"   Observation space keys: {list(self.env.observation_space.spaces.keys())}")
+            msg = f"✅ Environment initialized with {len(self.env.symbols)} symbols"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            msg = f"   Observation space keys: {list(self.env.observation_space.spaces.keys())}"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
         
         # Create CLSTM-PPO agent
         if HAS_CLSTM_PPO:
+            if self.is_main_process:
+                msg = "\n🤖 Creating CLSTM-PPO agent..."
+                print(msg, flush=True)
+                logger.info(msg)
+                import sys
+                sys.stdout.flush()
+                sys.stderr.flush()
+
             self.agent = OptionsCLSTMPPOAgent(
                 observation_space=self.env.observation_space,
                 action_space=self.env.action_space.n,
@@ -387,10 +404,23 @@ class EnhancedCLSTMPPOTrainer:
                 use_expiration_management=self.config.get('use_expiration_management', True)
             )
 
+            if self.is_main_process:
+                msg = "✅ Agent created successfully"
+                print(msg, flush=True)
+                logger.info(msg)
+                import sys
+                sys.stdout.flush()
+                sys.stderr.flush()
+
             # Wrap model with DistributedDataParallel if in distributed mode
             if self.distributed and hasattr(self.agent, 'network'):
                 if self.is_main_process:
-                    logger.info("🌐 Wrapping model with DistributedDataParallel...")
+                    msg = "🌐 Wrapping model with DistributedDataParallel..."
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
 
                 self.agent.network = DDP(
                     self.agent.network,
@@ -400,30 +430,76 @@ class EnhancedCLSTMPPOTrainer:
                 )
 
                 if self.is_main_process:
-                    logger.info("✅ Model wrapped with DDP")
+                    msg = "✅ Model wrapped with DDP"
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
 
             # Apply GPU optimizations (only if not using DDP, as DDP doesn't work well with compile)
             elif self.config.get('compile_model', True) and hasattr(torch, 'compile') and not self.distributed:
+                if self.is_main_process:
+                    msg = "🔧 Compiling model with torch.compile..."
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
                 try:
                     # PyTorch 2.0+ model compilation for speedup
                     if hasattr(self.agent, 'network'):
                         self.agent.network = torch.compile(self.agent.network, mode='reduce-overhead')
                         if self.is_main_process:
-                            logger.info("✅ Model compiled with torch.compile for faster training")
+                            msg = "✅ Model compiled with torch.compile for faster training"
+                            print(msg, flush=True)
+                            logger.info(msg)
+                            import sys
+                            sys.stdout.flush()
+                            sys.stderr.flush()
                 except Exception as e:
                     if self.is_main_process:
-                        logger.warning(f"⚠️ Model compilation failed: {e}")
+                        msg = f"⚠️ Model compilation failed: {e}"
+                        print(msg, flush=True)
+                        logger.warning(msg)
+                        import sys
+                        sys.stdout.flush()
+                        sys.stderr.flush()
 
             if self.is_main_process:
-                logger.info("✅ CLSTM-PPO agent initialized")
+                msg = "✅ CLSTM-PPO agent initialized"
+                print(msg, flush=True)
+                logger.info(msg)
+                import sys
+                sys.stdout.flush()
+                sys.stderr.flush()
 
             # Synchronize all processes before loading checkpoint
             if self.distributed:
+                if self.is_main_process:
+                    msg = "🔄 Synchronizing processes..."
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                 dist.barrier()
 
             # Try to resume from checkpoint (only main process loads, then broadcasts)
+            if self.is_main_process:
+                msg = "📂 Checking for existing checkpoint..."
+                print(msg, flush=True)
+                logger.info(msg)
+                import sys
+                sys.stdout.flush()
+                sys.stderr.flush()
+
             if self.is_main_process and self._load_checkpoint():
-                logger.info(f"✅ Resumed training from episode {self.episode}")
+                msg = f"✅ Resumed training from episode {self.episode}"
+                print(msg, flush=True)
+                logger.info(msg)
+
                 logger.info(f"   Total episodes trained: {self.total_episodes_trained}")
                 logger.info(f"   Best performance so far: {self.best_performance:.4f}")
                 logger.info(f"   🏆 BEST COMPOSITE SCORE: {self.best_composite_score:.1%}")
@@ -441,12 +517,28 @@ class EnhancedCLSTMPPOTrainer:
                 logger.info(f"   Best Sharpe ratio: {self.best_sharpe_ratio:.2f}")
                 logger.info(f"   Training metrics loaded: {len(self.episode_returns)} episodes")
                 logger.info(f"   🏆 Resuming from best composite model (optimizes WR+PR+Return together)")
+
+                import sys
+                sys.stdout.flush()
+                sys.stderr.flush()
             else:
-                logger.info("🆕 Starting fresh training")
+                if self.is_main_process:
+                    msg = "🆕 Starting fresh training"
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
 
                 # CLSTM pre-training if enabled and not resuming
                 if self.config.get('use_clstm_pretraining', False):
-                    logger.info("🎓 Starting CLSTM pre-training...")
+                    if self.is_main_process:
+                        msg = "🎓 Starting CLSTM pre-training..."
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        import sys
+                        sys.stdout.flush()
+                        sys.stderr.flush()
                     await self._pretrain_clstm()
         else:
             # Fallback to simple agent
@@ -1177,10 +1269,29 @@ class EnhancedCLSTMPPOTrainer:
         target_episodes = start_episode + num_episodes
 
         if self.is_main_process:
-            logger.info(f"🎯 Starting CLSTM-PPO training")
-            logger.info(f"   Episodes already trained: {start_episode}")
-            logger.info(f"   Episodes to train this session: {num_episodes}")
-            logger.info(f"   Target total episodes: {target_episodes}")
+            msg = f"\n{'='*80}\n🎯 Starting CLSTM-PPO training\n{'='*80}"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            msg = f"   Episodes already trained: {start_episode}"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            msg = f"   Episodes to train this session: {num_episodes}"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            msg = f"   Target total episodes: {target_episodes}"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            msg = f"{'='*80}\n"
+            print(msg, flush=True)
+            logger.info(msg)
+
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
 
         for local_episode in range(num_episodes):
             # Check for interruption
