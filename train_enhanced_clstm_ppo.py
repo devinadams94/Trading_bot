@@ -1771,7 +1771,14 @@ async def main():
                     print(f"✅ Ensemble methods enabled ({args.num_ensemble_models} models)")
                 print("✅ Agent learned to trade with complex features")
             else:
-                print("\n❌ Training completed but no trades produced")
+                # Check if trades happened but not profitable
+                total_trades = sum(trainer.episode_trades) if trainer.episode_trades else 0
+                if total_trades > 0:
+                    print(f"\n⚠️ Training completed with {total_trades} total trades but not yet profitable")
+                    print("   Continue training or adjust hyperparameters for better performance")
+                else:
+                    print("\n❌ Training completed but no trades produced")
+                    print("   Check exploration settings and reward function")
     else:
         # Multi-GPU distributed training
         logger.info(f"🌐 Multi-GPU distributed training mode: {world_size} GPUs")
