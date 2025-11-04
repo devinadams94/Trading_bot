@@ -274,6 +274,7 @@ epsilon = max(0.0, 0.2 * (1.0 - episode / (self.num_episodes * 0.1)))
 **`train_enhanced_clstm_ppo.py`**
 - Line 1666: Increased `entropy_coef` from 0.05 to 0.1
 - Lines 1118-1170: Added epsilon-greedy exploration with decay
+- Line 1118: Fixed to use `self.episode` instead of undefined `episode` variable
 
 **Run training now and watch the agent explore and learn to trade!** 🚀
 
