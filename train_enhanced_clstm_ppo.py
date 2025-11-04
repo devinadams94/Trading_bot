@@ -1133,7 +1133,7 @@ class EnhancedCLSTMPPOTrainer:
                         value = 0.0
 
                     if step % 100 == 0:
-                        logger.debug(f"Exploration: random action {action} (epsilon={epsilon:.3f})")
+                        logger.info(f"🎲 Exploration: random action {action} (epsilon={epsilon:.3f})")
                 else:
                     # Use ensemble if enabled and has models
                     if self.use_ensemble and self.ensemble and len(self.ensemble.models) > 0:
@@ -1177,6 +1177,10 @@ class EnhancedCLSTMPPOTrainer:
 
             # Execute step
             next_obs, reward, done, step_info = self.env.step(action)
+
+            # Log action distribution every 50 steps
+            if step % 50 == 0:
+                logger.info(f"Step {step}: action={action}, reward={reward:.4f}, trades={step_info.get('num_trades', 0)}")
 
             # Apply paper's enhanced reward function
             if self.config.get('use_portfolio_return_reward', False):
@@ -1247,7 +1251,15 @@ class EnhancedCLSTMPPOTrainer:
         portfolio_value = step_info.get('portfolio_value', self.env.initial_capital)
         portfolio_return = step_info.get('portfolio_return', 0.0)
         episode_trades = step_info.get('episode_trades', 0)
-        
+
+        # Log action distribution for debugging
+        action_counts = {}
+        for a in episode_actions:
+            action_counts[a] = action_counts.get(a, 0) + 1
+        unique_actions = len(action_counts)
+        most_common_action = max(action_counts.items(), key=lambda x: x[1]) if action_counts else (0, 0)
+        logger.info(f"Episode {self.episode}: {unique_actions} unique actions, most common: action {most_common_action[0]} ({most_common_action[1]} times), trades: {episode_trades}")
+
         # Calculate win rate
         profitable_trades = sum(1 for trade in self.env.trade_history if trade.get('pnl', 0) > 0)
         total_trades_this_episode = len(self.env.trade_history)
