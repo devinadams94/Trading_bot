@@ -49,6 +49,7 @@ import aiohttp
 import json
 import pickle
 import os
+import sys
 from collections import defaultdict
 import pytz
 import time
@@ -262,9 +263,13 @@ class OptimizedHistoricalOptionsDataLoader:
         total_symbols = len(symbols)
 
         logger.info(f"📊 Loading stock data for {total_symbols} symbols...")
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         for idx, symbol in enumerate(symbols, 1):
             logger.info(f"  [{idx}/{total_symbols}] Loading {symbol}...")
+            sys.stdout.flush()
+            sys.stderr.flush()
             try:
                 cache_key = self._get_cache_key(symbol, start_date, end_date, f"stock_{timeframe}")
                 cache_path = os.path.join(self.cache_dir, 'stocks', f"{cache_key}.pkl")
@@ -274,6 +279,8 @@ class OptimizedHistoricalOptionsDataLoader:
                     with open(cache_path, 'rb') as f:
                         data = pickle.load(f)
                     logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol} loaded from cache ({len(data)} rows)")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     result[symbol] = data
                     continue
 
@@ -1187,6 +1194,8 @@ class OptimizedHistoricalOptionsDataLoader:
         logger.info(f"  Estimated time: {2 if days < 180 else 5 if days < 365 else 15}-{5 if days < 180 else 15 if days < 365 else 30} minutes")
         logger.info(f"{'='*80}")
         logger.info(f"")
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         result = {}
 

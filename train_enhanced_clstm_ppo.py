@@ -355,6 +355,11 @@ class EnhancedCLSTMPPOTrainer:
                 logger.info(f"   ⏳ First load may take 10-30 minutes (data will be cached for future runs)")
             else:
                 logger.info(f"   ⏳ First load may take 2-5 minutes (data will be cached for future runs)")
+            logger.info(f"   📥 Starting data download... (watch for progress below)")
+            # Force flush to ensure message appears immediately
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
 
         await self.env.load_data(start_date, end_date)
 
