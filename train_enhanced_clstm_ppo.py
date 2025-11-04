@@ -344,8 +344,18 @@ class EnhancedCLSTMPPOTrainer:
 
         # Load market data
         # PAPER RECOMMENDATION: Use 2+ years of data for better LSTM feature extraction
+        # For faster startup, use fewer days (configurable via --data-days argument)
         end_date = datetime.now() - timedelta(days=1)
-        start_date = end_date - timedelta(days=730)  # 2 years of data (was 90 days)
+        data_days = self.config.get('data_days', 730)  # Default 2 years
+        start_date = end_date - timedelta(days=data_days)
+
+        if self.is_main_process:
+            logger.info(f"📊 Loading {data_days} days of market data ({start_date.date()} to {end_date.date()})")
+            if data_days >= 365:
+                logger.info(f"   ⏳ First load may take 10-30 minutes (data will be cached for future runs)")
+            else:
+                logger.info(f"   ⏳ First load may take 2-5 minutes (data will be cached for future runs)")
+
         await self.env.load_data(start_date, end_date)
 
         if self.is_main_process:
@@ -1496,7 +1506,19 @@ async def main():
     parser.add_argument('--early-stopping-min-delta', type=float, default=0.001,
                         help='Minimum improvement to reset patience (default: 0.001)')
 
+    # Data loading options
+    parser.add_argument('--data-days', type=int, default=730,
+                        help='Number of days of historical data to load (default: 730 = 2 years)')
+    parser.add_argument('--quick-test', action='store_true',
+                        help='Quick test mode: 3 symbols, 90 days data, 100 episodes')
+
     args = parser.parse_args()
+
+    # Quick test mode overrides
+    if args.quick_test:
+        args.data_days = 90
+        args.episodes = 100
+        logger.info("🚀 QUICK TEST MODE: 3 symbols, 90 days, 100 episodes")
 
     # Determine number of GPUs
     available_gpus = torch.cuda.device_count()
@@ -1506,16 +1528,23 @@ async def main():
         world_size = min(args.num_gpus, available_gpus)
 
     # Enhanced configuration
-    config = {
-        'num_episodes': args.episodes,
-        'use_clstm_pretraining': args.pretraining,
-        'symbols': [
+    # Quick test mode uses fewer symbols
+    if args.quick_test:
+        symbols_list = ['SPY', 'QQQ', 'AAPL']  # Just 3 symbols for quick testing
+    else:
+        symbols_list = [
             'SPY', 'QQQ', 'IWM',  # ETFs
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA',  # Mega cap
             'TSLA', 'META', 'NFLX', 'AMD', 'CRM',  # High vol tech
             'PLTR', 'SNOW', 'COIN', 'RBLX', 'ZM',  # Growth stocks
             'JPM', 'BAC', 'GS', 'V', 'MA'  # Financials
-        ],
+        ]
+
+    config = {
+        'num_episodes': args.episodes,
+        'use_clstm_pretraining': args.pretraining,
+        'symbols': symbols_list,
+        'data_days': args.data_days,  # Pass data_days to config
         'learning_rate_actor_critic': 1e-3,
         'learning_rate_clstm': 3e-3,
         'entropy_coef': 0.05,

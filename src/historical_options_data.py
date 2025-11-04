@@ -259,8 +259,12 @@ class OptimizedHistoricalOptionsDataLoader:
     ) -> Dict[str, pd.DataFrame]:
         """Load historical stock data using the new Alpaca data client"""
         result = {}
+        total_symbols = len(symbols)
 
-        for symbol in symbols:
+        logger.info(f"📊 Loading stock data for {total_symbols} symbols...")
+
+        for idx, symbol in enumerate(symbols, 1):
+            logger.info(f"  [{idx}/{total_symbols}] Loading {symbol}...")
             try:
                 cache_key = self._get_cache_key(symbol, start_date, end_date, f"stock_{timeframe}")
                 cache_path = os.path.join(self.cache_dir, 'stocks', f"{cache_key}.pkl")
@@ -269,7 +273,7 @@ class OptimizedHistoricalOptionsDataLoader:
                 if self._is_cache_valid(cache_key) and os.path.exists(cache_path):
                     with open(cache_path, 'rb') as f:
                         data = pickle.load(f)
-                    logger.info(f"Loaded {symbol} stock data from cache")
+                    logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol} loaded from cache ({len(data)} rows)")
                     result[symbol] = data
                     continue
 
@@ -297,9 +301,9 @@ class OptimizedHistoricalOptionsDataLoader:
                 quality_metrics = self._validate_data_quality(data, f"{symbol}_stock")
 
                 if quality_metrics.quality_score < 0.3:
-                    logger.warning(f"Low quality stock data for {symbol}: {quality_metrics.quality_score:.2f}")
+                    logger.warning(f"  [{idx}/{total_symbols}] ⚠️ {symbol}: Low quality ({quality_metrics.quality_score:.2f})")
                 else:
-                    logger.info(f"Good quality stock data for {symbol}: {quality_metrics.quality_score:.2f}")
+                    logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (quality: {quality_metrics.quality_score:.2f})")
 
                 # Cache the data
                 with open(cache_path, 'wb') as f:
@@ -315,10 +319,9 @@ class OptimizedHistoricalOptionsDataLoader:
                 }
 
                 result[symbol] = data
-                logger.info(f"Loaded {len(data)} stock bars for {symbol}")
 
             except Exception as e:
-                logger.error(f"Error loading stock data for {symbol}: {e}")
+                logger.error(f"  [{idx}/{total_symbols}] ❌ {symbol}: {e}")
                 continue
 
         self._save_cache_index()
@@ -346,7 +349,8 @@ class OptimizedHistoricalOptionsDataLoader:
         if not start_date:
             start_date = end_date - timedelta(days=7)
 
-        logger.info(f"Loading historical options data for {symbols} from {start_date.date()} to {end_date.date()}")
+        total_symbols = len(symbols)
+        logger.info(f"📊 Loading historical options data for {total_symbols} symbols from {start_date.date()} to {end_date.date()}")
 
         result = {}
 
@@ -354,7 +358,9 @@ class OptimizedHistoricalOptionsDataLoader:
         stock_data = await self.load_historical_stock_data(symbols, start_date, end_date)
 
         # Process each symbol
-        for sym in symbols:
+        logger.info(f"📈 Processing options chains for {total_symbols} symbols...")
+        for idx, sym in enumerate(symbols, 1):
+            logger.info(f"  [{idx}/{total_symbols}] Processing options for {sym}...")
             try:
                 cache_key = self._get_cache_key(sym, start_date, end_date, "options")
                 cache_path = os.path.join(self.cache_dir, 'options', f"{cache_key}.pkl")
@@ -363,7 +369,7 @@ class OptimizedHistoricalOptionsDataLoader:
                 if use_cache and self._is_cache_valid(cache_key) and os.path.exists(cache_path):
                     with open(cache_path, 'rb') as f:
                         symbol_data = pickle.load(f)
-                    logger.info(f"Loaded {len(symbol_data)} options records from cache for {sym}")
+                    logger.info(f"  [{idx}/{total_symbols}] ✅ {sym} options loaded from cache ({len(symbol_data)} contracts)")
                     result[sym] = symbol_data
                     continue
 
@@ -382,7 +388,7 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 # Fall back to simulated data if real data unavailable
                 if not symbol_data and sym in stock_data:
-                    logger.info(f"Generating simulated options data for {sym}")
+                    logger.info(f"  [{idx}/{total_symbols}] 🔄 Generating simulated options for {sym}...")
                     symbol_data = await self._generate_simulated_options_data(
                         sym, start_date, end_date, stock_data[sym]
                     )
@@ -407,12 +413,12 @@ class OptimizedHistoricalOptionsDataLoader:
                         }
 
                     result[sym] = symbol_data
-                    logger.info(f"Loaded {len(symbol_data)} options records for {sym}")
+                    logger.info(f"  [{idx}/{total_symbols}] ✅ {sym}: {len(symbol_data)} options contracts (quality: {quality_metrics.quality_score:.2f})")
                 else:
-                    logger.warning(f"No options data available for {sym}")
+                    logger.warning(f"  [{idx}/{total_symbols}] ⚠️ {sym}: No options data available")
 
             except Exception as e:
-                logger.error(f"Error processing options data for {sym}: {e}")
+                logger.error(f"  [{idx}/{total_symbols}] ❌ {sym}: {e}")
                 continue
 
         # Store in instance variable for later use
@@ -421,7 +427,7 @@ class OptimizedHistoricalOptionsDataLoader:
                 self.historical_data[sym] = data
 
         self._save_cache_index()
-        logger.info(f"Loaded historical options data for {len(result)} symbols")
+        logger.info(f"✅ Completed loading options data for {len(result)}/{total_symbols} symbols")
         return result
 
     async def _fetch_real_options_data(
@@ -1170,29 +1176,42 @@ class OptimizedHistoricalOptionsDataLoader:
         Main data loading method called by training environment.
         Combines stock and options data for comprehensive market information.
         """
-        logger.info(f"Loading historical data for {len(symbols)} symbols from {start_date.date()} to {end_date.date()}")
-        
+        total_symbols = len(symbols)
+        days = (end_date - start_date).days
+        logger.info(f"")
+        logger.info(f"{'='*80}")
+        logger.info(f"📊 DATA LOADING STARTED")
+        logger.info(f"{'='*80}")
+        logger.info(f"  Symbols: {total_symbols}")
+        logger.info(f"  Date range: {start_date.date()} to {end_date.date()} ({days} days)")
+        logger.info(f"  Estimated time: {2 if days < 180 else 5 if days < 365 else 15}-{5 if days < 180 else 15 if days < 365 else 30} minutes")
+        logger.info(f"{'='*80}")
+        logger.info(f"")
+
         result = {}
-        
+
         try:
             # First, try to load stock data (more reliable and always available)
-            logger.info("Loading stock data...")
+            logger.info("📈 STEP 1/2: Loading stock data...")
             stock_data = await self.load_historical_stock_data(
                 symbols=symbols,
                 start_date=start_date,
                 end_date=end_date,
                 timeframe="1Hour"
             )
-            
+
             if stock_data:
-                logger.info(f"✅ Loaded stock data for {len(stock_data)} symbols")
+                logger.info(f"")
+                logger.info(f"✅ Stock data loaded for {len(stock_data)}/{total_symbols} symbols")
+                logger.info(f"")
                 result.update(stock_data)
             else:
                 logger.warning("⚠️ No stock data loaded")
             
             # Try to load options data if we have stock data
             if result:
-                logger.info("Attempting to load options data...")
+                logger.info("📊 STEP 2/2: Loading options data...")
+                logger.info("")
                 try:
                     options_data = await self.load_historical_options_data(
                         symbols=symbols,
@@ -1200,9 +1219,11 @@ class OptimizedHistoricalOptionsDataLoader:
                         end_date=end_date,
                         use_cache=use_cache
                     )
-                    
+
                     if options_data:
-                        logger.info(f"✅ Loaded options data for {len(options_data)} symbols")
+                        logger.info(f"")
+                        logger.info(f"✅ Options data loaded for {len(options_data)}/{total_symbols} symbols")
+                        logger.info(f"")
                         # Merge options data with stock data
                         for symbol in symbols:
                             if symbol in result and symbol in options_data:
@@ -1221,6 +1242,7 @@ class OptimizedHistoricalOptionsDataLoader:
                     logger.info("ℹ️ Continuing with stock data only")
             
             # Validate and clean the data
+            logger.info("🔍 Validating data quality...")
             validated_result = {}
             for symbol, data in result.items():
                 if isinstance(data, pd.DataFrame) and not data.empty:
@@ -1232,9 +1254,18 @@ class OptimizedHistoricalOptionsDataLoader:
                         logger.warning(f"⚠️ Insufficient data for {symbol}: {len(data)} points")
                 else:
                     logger.warning(f"⚠️ Invalid data format for {symbol}")
-            
+
             if validated_result:
-                logger.info(f"✅ Successfully loaded data for {len(validated_result)} symbols")
+                logger.info(f"")
+                logger.info(f"{'='*80}")
+                logger.info(f"✅ DATA LOADING COMPLETE")
+                logger.info(f"{'='*80}")
+                logger.info(f"  Successfully loaded: {len(validated_result)}/{total_symbols} symbols")
+                total_rows = sum(len(df) for df in validated_result.values())
+                logger.info(f"  Total data points: {total_rows:,}")
+                logger.info(f"  Ready for training!")
+                logger.info(f"{'='*80}")
+                logger.info(f"")
                 return validated_result
             else:
                 logger.error("❌ No valid data loaded for any symbol")
