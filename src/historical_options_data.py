@@ -210,6 +210,26 @@ class OptimizedHistoricalOptionsDataLoader:
             if self.request_count % 100 == 0:
                 logger.info(f"Made {self.request_count} API requests")
 
+    async def _rate_limit_async(self):
+        """Async rate limiting that doesn't block the event loop"""
+        with self.rate_limit_lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+
+            if time_since_last < self.rate_limit_delay:
+                sleep_time = self.rate_limit_delay - time_since_last
+                # Use asyncio.sleep instead of time.sleep to not block event loop
+                await asyncio.sleep(sleep_time)
+
+            self.last_request_time = time.time()
+            self.request_count += 1
+
+            # Log every 10 requests for better progress feedback
+            if self.request_count % 10 == 0:
+                logger.info(f"📡 Made {self.request_count} API requests")
+                sys.stdout.flush()
+                sys.stderr.flush()
+
     def _validate_data_quality(self, data: pd.DataFrame, symbol: str) -> DataQualityMetrics:
         """Validate data quality and return metrics"""
         metrics = DataQualityMetrics()
@@ -285,7 +305,7 @@ class OptimizedHistoricalOptionsDataLoader:
                     continue
 
                 # Fetch from API
-                self._rate_limit()
+                await self._rate_limit_async()
 
                 request = StockBarsRequest(
                     symbol_or_symbols=symbol,
@@ -294,7 +314,8 @@ class OptimizedHistoricalOptionsDataLoader:
                     end=end_date
                 )
 
-                bars = self.stock_data_client.get_stock_bars(request)
+                # Run blocking API call in thread pool to not block event loop
+                bars = await asyncio.to_thread(self.stock_data_client.get_stock_bars, request)
 
                 if bars.df.empty:
                     logger.warning(f"No stock data returned for {symbol}")
@@ -455,14 +476,15 @@ class OptimizedHistoricalOptionsDataLoader:
                 expiration_date_lte=(end_date + timedelta(days=45)).date()  # Include options expiring after our date range
             )
 
-            # Use sync rate limiting since this is calling sync API
-            self._rate_limit()
+            # Use async rate limiting to not block event loop
+            await self._rate_limit_async()
 
             # Log the request details for debugging
             logger.debug(f"Fetching options chain for {symbol} from {start_date.date()} to {(end_date + timedelta(days=45)).date()}")
 
             try:
-                options_chain = self.options_data_client.get_option_chain(chain_request)
+                # Run blocking API call in thread pool
+                options_chain = await asyncio.to_thread(self.options_data_client.get_option_chain, chain_request)
             except Exception as api_error:
                 logger.error(f"API error fetching options chain for {symbol}: {type(api_error).__name__}: {api_error}")
                 logger.info(f"Falling back to simulated data for {symbol}")
@@ -561,8 +583,9 @@ class OptimizedHistoricalOptionsDataLoader:
                             end=current_date + timedelta(days=1)
                         )
 
-                        self._rate_limit()
-                        bars = self.options_data_client.get_option_bars(bars_request)
+                        await self._rate_limit_async()
+                        # Run blocking API call in thread pool
+                        bars = await asyncio.to_thread(self.options_data_client.get_option_bars, bars_request)
 
                         if not bars.df.empty:
                             for _, bar in bars.df.iterrows():
