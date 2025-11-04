@@ -845,15 +845,32 @@ class OptimizedHistoricalOptionsDataLoader:
                         sys.stdout.flush()
                         sys.stderr.flush()
 
+                        # Debug: Check DataFrame structure
+                        if current_batch == 1:
+                            msg = f"      🔍 DataFrame info: index={bars.df.index.names}, columns={list(bars.df.columns)}"
+                            print(msg, flush=True)
+                            logger.debug(msg)
+                            sys.stdout.flush()
+                            sys.stderr.flush()
+
                         # Process all bars from this batch
-                        for _, bar in bars.df.iterrows():
-                            # Find the option details from chain_list
-                            option_symbol = bar.get('symbol', None)
+                        # Alpaca returns MultiIndex DataFrame with (symbol, timestamp) as index
+                        bars_processed = 0
+                        for idx, bar in bars.df.iterrows():
+                            # Extract symbol from MultiIndex
+                            if isinstance(idx, tuple):
+                                option_symbol = idx[0]  # First element is symbol
+                                bar_timestamp = idx[1]  # Second element is timestamp
+                            else:
+                                # Single index - might be timestamp, symbol in columns
+                                option_symbol = bar.get('symbol', None)
+                                bar_timestamp = idx
+
                             if option_symbol:
+                                # Find the option details from chain_list
                                 option_info = next((opt for opt in chain_list if opt['symbol'] == option_symbol), None)
                                 if option_info:
                                     # Get stock price for this timestamp
-                                    bar_timestamp = bar.name if hasattr(bar, 'name') else bar.get('timestamp')
                                     stock_price = self._get_stock_price_for_date(stock_data, bar_timestamp)
 
                                     options_data.append({
@@ -878,8 +895,9 @@ class OptimizedHistoricalOptionsDataLoader:
                                         'vega': bar.get('vega', 0.2),
                                         'rho': bar.get('rho', 0.1)
                                     })
+                                    bars_processed += 1
 
-                        msg = f"      ✅ Batch {current_batch}/{total_batches} complete: {len(bars.df)} bars processed"
+                        msg = f"      ✅ Batch {current_batch}/{total_batches} complete: {bars_processed} options data points added (from {len(bars.df)} bars)"
                         print(msg, flush=True)
                         logger.info(msg)
                         sys.stdout.flush()
@@ -904,6 +922,16 @@ class OptimizedHistoricalOptionsDataLoader:
             logger.info(msg)
             sys.stdout.flush()
             sys.stderr.flush()
+
+            if len(options_data) == 0:
+                msg = f"      ⚠️ WARNING: No options data was extracted from API responses!"
+                print(msg, flush=True)
+                logger.warning(msg)
+                msg = f"      💡 This may be due to: (1) MultiIndex parsing issue, (2) Symbol mismatch, (3) No matching options in chain"
+                print(msg, flush=True)
+                logger.warning(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
 
         except Exception as e:
             msg = f"      ❌ Error fetching real options data for {symbol}: {e}"
