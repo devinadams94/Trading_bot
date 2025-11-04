@@ -1114,41 +1114,60 @@ class EnhancedCLSTMPPOTrainer:
 
             # Get action from CLSTM-PPO agent (if not overridden by turbulence)
             if 'action' not in locals():
-                # Use ensemble if enabled and has models
-                if self.use_ensemble and self.ensemble and len(self.ensemble.models) > 0:
-                    try:
-                        action, confidence = self.ensemble.predict_action(obs, deterministic=False)
-                        # Get log_prob and value from first model for training
-                        if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
-                            _, info = self.agent.act(obs)
-                            log_prob = info.get('log_prob', 0.0)
-                            value = info.get('value', 0.0)
-                        else:
-                            log_prob = 0.0
-                            value = 0.0
+                # EXPLORATION: Use epsilon-greedy for first 20% of episodes to encourage exploration
+                epsilon = max(0.0, 0.3 * (1.0 - episode / (self.num_episodes * 0.2)))
+                use_random_action = (np.random.random() < epsilon)
 
-                        if step % 50 == 0:  # Log occasionally
-                            logger.debug(f"Ensemble action: {action} (confidence: {confidence:.2%})")
-                    except Exception as e:
-                        logger.warning(f"Ensemble prediction failed: {e}, falling back to single model")
-                        if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
-                            action, info = self.agent.act(obs)
-                            log_prob = info.get('log_prob', 0.0)
-                            value = info.get('value', 0.0)
-                        else:
-                            action, info = self.agent.act(obs)
-                            log_prob = info.get('log_prob', 0.0)
-                            value = 0.0
-                else:
-                    # Single model prediction
+                if use_random_action:
+                    # Random exploration - sample uniformly from action space
+                    action = np.random.randint(0, self.env.action_space.n)
+                    # Still get log_prob and value from model for training
                     if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
-                        action, info = self.agent.act(obs)
+                        _, info = self.agent.act(obs)
                         log_prob = info.get('log_prob', 0.0)
                         value = info.get('value', 0.0)
                     else:
-                        action, info = self.agent.act(obs)
-                        log_prob = info.get('log_prob', 0.0)
+                        log_prob = 0.0
                         value = 0.0
+
+                    if step % 100 == 0:
+                        logger.debug(f"Exploration: random action {action} (epsilon={epsilon:.3f})")
+                else:
+                    # Use ensemble if enabled and has models
+                    if self.use_ensemble and self.ensemble and len(self.ensemble.models) > 0:
+                        try:
+                            action, confidence = self.ensemble.predict_action(obs, deterministic=False)
+                            # Get log_prob and value from first model for training
+                            if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
+                                _, info = self.agent.act(obs)
+                                log_prob = info.get('log_prob', 0.0)
+                                value = info.get('value', 0.0)
+                            else:
+                                log_prob = 0.0
+                                value = 0.0
+
+                            if step % 50 == 0:  # Log occasionally
+                                logger.debug(f"Ensemble action: {action} (confidence: {confidence:.2%})")
+                        except Exception as e:
+                            logger.warning(f"Ensemble prediction failed: {e}, falling back to single model")
+                            if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
+                                action, info = self.agent.act(obs)
+                                log_prob = info.get('log_prob', 0.0)
+                                value = info.get('value', 0.0)
+                            else:
+                                action, info = self.agent.act(obs)
+                                log_prob = info.get('log_prob', 0.0)
+                                value = 0.0
+                    else:
+                        # Single model prediction
+                        if HAS_CLSTM_PPO and hasattr(self.agent, 'act'):
+                            action, info = self.agent.act(obs)
+                            log_prob = info.get('log_prob', 0.0)
+                            value = info.get('value', 0.0)
+                        else:
+                            action, info = self.agent.act(obs)
+                            log_prob = info.get('log_prob', 0.0)
+                            value = 0.0
             else:
                 # Turbulence override - set default values
                 log_prob = 0.0
@@ -1663,7 +1682,7 @@ async def main():
         'data_days': args.data_days,  # Pass data_days to config
         'learning_rate_actor_critic': 1e-3,
         'learning_rate_clstm': 3e-3,
-        'entropy_coef': 0.05,
+        'entropy_coef': 0.1,  # INCREASED: Higher exploration (was 0.05)
         'include_technical_indicators': True,
         'include_market_microstructure': True,
         # NEW: Enable realistic transaction costs
