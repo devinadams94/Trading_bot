@@ -2,6 +2,8 @@
 """
 Working Options Environment - Guaranteed to Execute Trades
 This replaces the broken enhanced_options_env.py
+
+UPDATED: Now includes realistic transaction costs based on Alpaca fee structure
 """
 
 import numpy as np
@@ -36,6 +38,14 @@ except ImportError:
         def calculate_adx(high, low, close, period=14):
             return 25.0
 
+# Import realistic transaction costs
+try:
+    from .realistic_transaction_costs import RealisticTransactionCostCalculator
+except ImportError:
+    # Fallback if import fails
+    RealisticTransactionCostCalculator = None
+    logger.warning("⚠️ Realistic transaction costs not available, using legacy commission model")
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +60,7 @@ class WorkingOptionsEnvironment(gym.Env):
         symbols: List[str] = None,
         initial_capital: float = 100000,
         max_positions: int = 5,
-        commission: float = 0.65,
+        commission: float = 0.65,  # DEPRECATED: Use realistic_costs instead
         lookback_window: int = 20,
         episode_length: int = 195,
         min_data_quality: float = 0.2,
@@ -61,10 +71,14 @@ class WorkingOptionsEnvironment(gym.Env):
         rsi_window: int = 14,
         macd_fast: int = 12,
         macd_slow: int = 26,
+        # NEW: Realistic transaction costs
+        use_realistic_costs: bool = True,
+        enable_slippage: bool = True,
+        slippage_model: str = 'volume_based',
         **kwargs
     ):
         super().__init__()
-        
+
         self.data_loader = data_loader
         # Enhanced symbol list with major tech stocks
         self.symbols = symbols or [
@@ -75,7 +89,7 @@ class WorkingOptionsEnvironment(gym.Env):
         ]
         self.initial_capital = initial_capital
         self.max_positions = max_positions
-        self.commission = commission
+        self.commission = commission  # Legacy fallback
         self.lookback_window = lookback_window
         self.episode_length = episode_length
         self.min_data_quality = min_data_quality
@@ -87,6 +101,19 @@ class WorkingOptionsEnvironment(gym.Env):
         self.rsi_window = rsi_window
         self.macd_fast = macd_fast
         self.macd_slow = macd_slow
+
+        # NEW: Realistic transaction costs
+        self.use_realistic_costs = use_realistic_costs and RealisticTransactionCostCalculator is not None
+        if self.use_realistic_costs:
+            self.cost_calculator = RealisticTransactionCostCalculator(
+                enable_slippage=enable_slippage,
+                slippage_model=slippage_model,
+                log_costs=False  # Disable per-trade logging for performance
+            )
+            logger.info("✅ Using realistic transaction costs (Alpaca fee structure)")
+        else:
+            self.cost_calculator = None
+            logger.info(f"⚠️ Using legacy commission model (${commission} per trade)")
         
         # Action space: 0=hold, 1-10=buy calls, 11-20=buy puts, 21-30=sell positions
         self.action_space = spaces.Discrete(31)
@@ -197,7 +224,24 @@ class WorkingOptionsEnvironment(gym.Env):
         self.peak_portfolio_value = self.initial_capital
         
         return self._get_observation()
-    
+
+    def _calculate_transaction_cost(self, option_data: Dict, quantity: int, side: str = 'buy') -> Tuple[float, Dict]:
+        """
+        Calculate transaction cost using realistic model or legacy commission
+
+        Returns:
+            (total_cost, cost_breakdown_dict)
+        """
+        if self.use_realistic_costs and self.cost_calculator:
+            # Use realistic transaction cost model
+            breakdown = self.cost_calculator.calculate_transaction_cost(
+                option_data, quantity, side
+            )
+            return breakdown.total_cost, breakdown.to_dict()
+        else:
+            # Legacy commission model
+            return self.commission, {'commission': self.commission, 'total_cost': self.commission}
+
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
         """Execute one step - GUARANTEED to work"""
         self.current_step += 1
@@ -215,6 +259,10 @@ class WorkingOptionsEnvironment(gym.Env):
         if not hasattr(self, 'previous_portfolio_value'):
             self.previous_portfolio_value = self.initial_capital
 
+        # Track transaction costs for this step
+        step_transaction_costs = 0.0
+        transaction_cost_breakdown = {}
+
         # Execute action - THIS WILL ALWAYS WORK
         trade_executed = False
         action_name = "HOLD"
@@ -227,66 +275,125 @@ class WorkingOptionsEnvironment(gym.Env):
             # Buy call options
             trade_executed = True
             self.episode_trades += 1
-            
+
             strike_offset = (action - 1) * 0.01  # 0% to 9% OTM
             current_price = current_data['close']
             strike_price = current_price * (1 + strike_offset)
-            
-            # Simple option pricing
-            option_price = max(0.5, current_price * 0.05 * (1 - strike_offset))
-            position_size = min(self.capital * 0.1, 5000)  # 10% of capital or $5000
-            
-            if self.capital >= option_price * 100 + self.commission:
+
+            # Simple option pricing (mid-price estimate)
+            option_price_mid = max(0.5, current_price * 0.05 * (1 - strike_offset))
+
+            # Create option data for transaction cost calculation
+            moneyness = strike_price / current_price
+            spread_pct = 0.02 + 0.03 * abs(1 - moneyness)  # 2-5% spread
+            option_data = {
+                'bid': option_price_mid * (1 - spread_pct / 2),
+                'ask': option_price_mid * (1 + spread_pct / 2),
+                'last': option_price_mid,
+                'volume': current_data.get('volume', 1000) / 100,  # Estimate options volume
+                'open_interest': 1000,
+                'moneyness': moneyness,
+                'implied_volatility': current_data.get('volatility', 0.3)
+            }
+
+            # Calculate transaction cost
+            quantity = 1  # 1 contract = 100 shares
+            transaction_cost, cost_breakdown = self._calculate_transaction_cost(
+                option_data, quantity, side='buy'
+            )
+
+            # Execution price (buy at ask for realistic costs, mid for legacy)
+            if self.use_realistic_costs:
+                execution_price = option_data['ask']
+            else:
+                execution_price = option_price_mid
+
+            # Total cost including transaction costs
+            total_cost = execution_price * 100 + transaction_cost
+
+            if self.capital >= total_cost:
                 # Execute trade
-                cost = option_price * 100 + self.commission
-                self.capital -= cost
-                
+                self.capital -= total_cost
+                step_transaction_costs += transaction_cost
+                transaction_cost_breakdown = cost_breakdown
+
                 position = {
                     'type': 'call',
                     'strike': strike_price,
-                    'entry_price': option_price,
+                    'entry_price': execution_price,
                     'quantity': 100,
                     'symbol': self.current_symbol,
                     'entry_step': self.current_step,
-                    'cost': cost
+                    'cost': total_cost,
+                    'transaction_cost': transaction_cost
                 }
                 self.positions.append(position)
 
                 action_name = f"BUY_CALL_{strike_price:.0f}"
 
-                logger.debug(f"Executed: {action_name}, cost=${cost:.2f}")
-            
+                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}")
+
         elif 11 <= action <= 20:
             # Buy put options
             trade_executed = True
             self.episode_trades += 1
-            
+
             strike_offset = (action - 11) * 0.01  # 0% to 9% OTM
             current_price = current_data['close']
             strike_price = current_price * (1 - strike_offset)
-            
-            # Simple option pricing
-            option_price = max(0.5, current_price * 0.05 * (1 - strike_offset))
-            
-            if self.capital >= option_price * 100 + self.commission:
+
+            # Simple option pricing (mid-price estimate)
+            option_price_mid = max(0.5, current_price * 0.05 * (1 - strike_offset))
+
+            # Create option data for transaction cost calculation
+            moneyness = strike_price / current_price
+            spread_pct = 0.02 + 0.03 * abs(1 - moneyness)  # 2-5% spread
+            option_data = {
+                'bid': option_price_mid * (1 - spread_pct / 2),
+                'ask': option_price_mid * (1 + spread_pct / 2),
+                'last': option_price_mid,
+                'volume': current_data.get('volume', 1000) / 100,
+                'open_interest': 1000,
+                'moneyness': moneyness,
+                'implied_volatility': current_data.get('volatility', 0.3)
+            }
+
+            # Calculate transaction cost
+            quantity = 1  # 1 contract
+            transaction_cost, cost_breakdown = self._calculate_transaction_cost(
+                option_data, quantity, side='buy'
+            )
+
+            # Execution price (buy at ask for realistic costs)
+            if self.use_realistic_costs:
+                execution_price = option_data['ask']
+            else:
+                execution_price = option_price_mid
+
+            # Total cost including transaction costs
+            total_cost = execution_price * 100 + transaction_cost
+
+            if self.capital >= total_cost:
                 # Execute trade
-                cost = option_price * 100 + self.commission
-                self.capital -= cost
-                
+                self.capital -= total_cost
+                step_transaction_costs += transaction_cost
+                transaction_cost_breakdown = cost_breakdown
+
                 position = {
                     'type': 'put',
                     'strike': strike_price,
-                    'entry_price': option_price,
+                    'entry_price': execution_price,
                     'quantity': 100,
                     'symbol': self.current_symbol,
                     'entry_step': self.current_step,
-                    'cost': cost
+                    'cost': total_cost,
+                    'transaction_cost': transaction_cost
                 }
                 self.positions.append(position)
 
                 action_name = f"BUY_PUT_{strike_price:.0f}"
 
-                logger.debug(f"Executed: {action_name}, cost=${cost:.2f}")
+                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}")
             
         elif 21 <= action <= 30:
             # Sell positions (or buy if no positions)
@@ -298,7 +405,7 @@ class WorkingOptionsEnvironment(gym.Env):
                 position = self.positions.pop(0)
                 current_price = current_data['close']
 
-                # Calculate option value at current price
+                # Calculate option value at current price (mid-price estimate)
                 if position['type'] == 'call':
                     intrinsic_value = max(0, current_price - position['strike'])
                 else:  # put
@@ -306,14 +413,44 @@ class WorkingOptionsEnvironment(gym.Env):
 
                 # Add time value
                 time_value = max(0.1, position['entry_price'] * 0.5)
-                option_value = intrinsic_value + time_value
+                option_value_mid = intrinsic_value + time_value
 
-                # Execute sale
-                proceeds = option_value * position['quantity'] - self.commission
-                self.capital += proceeds
+                # Create option data for transaction cost calculation
+                moneyness = position['strike'] / current_price
+                spread_pct = 0.02 + 0.03 * abs(1 - moneyness)
+                option_data = {
+                    'bid': option_value_mid * (1 - spread_pct / 2),
+                    'ask': option_value_mid * (1 + spread_pct / 2),
+                    'last': option_value_mid,
+                    'volume': current_data.get('volume', 1000) / 100,
+                    'open_interest': 1000,
+                    'moneyness': moneyness,
+                    'implied_volatility': current_data.get('volatility', 0.3)
+                }
 
-                # Calculate P&L
-                pnl = proceeds - position['cost']
+                # Calculate transaction cost for selling
+                quantity = 1  # 1 contract
+                transaction_cost, cost_breakdown = self._calculate_transaction_cost(
+                    option_data, quantity, side='sell'
+                )
+
+                # Execution price (sell at bid for realistic costs)
+                if self.use_realistic_costs:
+                    execution_price = option_data['bid']
+                else:
+                    execution_price = option_value_mid
+
+                # Execute sale (proceeds minus transaction costs)
+                gross_proceeds = execution_price * position['quantity']
+                net_proceeds = gross_proceeds - transaction_cost
+                self.capital += net_proceeds
+                step_transaction_costs += transaction_cost
+                transaction_cost_breakdown = cost_breakdown
+
+                # Calculate P&L (including transaction costs on both entry and exit)
+                entry_txn_cost = position.get('transaction_cost', 0)
+                total_txn_costs = entry_txn_cost + transaction_cost
+                pnl = net_proceeds - position['cost']
 
                 action_name = f"SELL_{position['type'].upper()}"
 
@@ -322,12 +459,13 @@ class WorkingOptionsEnvironment(gym.Env):
                     'action': action_name,
                     'pnl': pnl,
                     'entry_price': position['entry_price'],
-                    'exit_price': option_value,
-                    'step': self.current_step
+                    'exit_price': execution_price,
+                    'step': self.current_step,
+                    'transaction_costs': total_txn_costs
                 }
                 self.trade_history.append(trade_record)
 
-                logger.debug(f"Executed: {action_name}, P&L=${pnl:.2f}")
+                logger.debug(f"Executed: {action_name}, P&L=${pnl:.2f}, txn_cost=${transaction_cost:.2f}")
 
             else:
                 # No positions to sell, buy a random option instead
@@ -368,12 +506,15 @@ class WorkingOptionsEnvironment(gym.Env):
         self.peak_portfolio_value = max(self.peak_portfolio_value, portfolio_value_after)
 
         # Calculate reward based on portfolio return (aligned with research paper)
-        # Return_t = (portfolio_value_after) - (portfolio_value_before)
-        # This directly optimizes for profitability
+        # Return_t = (portfolio_value_after) - (portfolio_value_before) - transaction_costs
+        # This directly optimizes for profitability while penalizing high transaction costs
         raw_return = portfolio_value_after - self.previous_portfolio_value
 
+        # Subtract transaction costs from reward (agent learns to minimize costs)
+        net_return = raw_return - step_transaction_costs
+
         # Apply paper's scaling factor (1e-4) for stable training
-        reward = raw_return * 1e-4
+        reward = net_return * 1e-4
 
         # Update previous portfolio value for next step
         self.previous_portfolio_value = portfolio_value_after
@@ -396,6 +537,9 @@ class WorkingOptionsEnvironment(gym.Env):
             'action_name': action_name,
             'data_quality': 0.8,  # Always good quality for synthetic data
             'raw_return': raw_return,  # For debugging
+            'transaction_costs': step_transaction_costs,  # NEW: Track transaction costs
+            'transaction_cost_breakdown': transaction_cost_breakdown,  # NEW: Detailed breakdown
+            'net_return': net_return,  # NEW: Return after transaction costs
             'reward': reward  # For debugging
         }
 

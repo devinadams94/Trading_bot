@@ -194,6 +194,10 @@ class OptionsCLSTMPPONetwork(nn.Module):
         self.clstm_encoder.price_head = nn.Linear(hidden_dim, 1)
         self.clstm_encoder.volatility_head = nn.Linear(hidden_dim, 1)
         self.clstm_encoder.volume_head = nn.Linear(hidden_dim, 1)
+
+        # OPTIMIZATION: Implied Volatility prediction head
+        from src.advanced_optimizations import ImpliedVolatilityPredictor
+        self.iv_predictor = ImpliedVolatilityPredictor(hidden_dim)
         
         # Actor network (policy)
         self.actor = nn.Sequential(
@@ -324,7 +328,7 @@ class OptionsCLSTMPPONetwork(nn.Module):
 
 class OptionsCLSTMPPOAgent:
     """Combined CLSTM-PPO agent with both supervised and RL training"""
-    
+
     def __init__(
         self,
         observation_space: Dict,
@@ -339,7 +343,11 @@ class OptionsCLSTMPPOAgent:
         max_grad_norm: float = 0.5,
         batch_size: int = 256,  # FIXED: Increased from 64 for better GPU utilization
         n_epochs: int = 10,
-        device: str = None
+        device: str = None,
+        # OPTIMIZATION: Advanced features
+        use_sharpe_shaping: bool = True,
+        use_greeks_sizing: bool = True,
+        use_expiration_management: bool = True
     ):
         # Auto-detect best available device
         if device is None:
@@ -385,10 +393,33 @@ class OptionsCLSTMPPOAgent:
         
         # Experience buffer
         self.buffer = RolloutBuffer()
-        
+
         # Supervised learning buffer for CLSTM
         self.supervised_buffer = SupervisedBuffer(maxlen=10000)
-        
+
+        # OPTIMIZATION: Initialize advanced components
+        from src.advanced_optimizations import (
+            SharpeRatioRewardShaper,
+            GreeksBasedPositionSizer,
+            ExpirationManager
+        )
+
+        self.use_sharpe_shaping = use_sharpe_shaping
+        self.use_greeks_sizing = use_greeks_sizing
+        self.use_expiration_management = use_expiration_management
+
+        if self.use_sharpe_shaping:
+            self.sharpe_shaper = SharpeRatioRewardShaper()
+            logger.info("✅ Sharpe ratio reward shaping enabled")
+
+        if self.use_greeks_sizing:
+            self.greeks_sizer = GreeksBasedPositionSizer()
+            logger.info("✅ Greeks-based position sizing enabled")
+
+        if self.use_expiration_management:
+            self.expiration_manager = ExpirationManager()
+            logger.info("✅ Expiration management enabled")
+
         # Training metrics
         self.training_step = 0
         self.episode_rewards = deque(maxlen=100)
@@ -629,10 +660,16 @@ class OptionsCLSTMPPOAgent:
         done: bool,
         info: Dict
     ):
+        # OPTIMIZATION: Apply Sharpe ratio reward shaping
+        if self.use_sharpe_shaping and hasattr(self, 'sharpe_shaper'):
+            shaped_reward = self.sharpe_shaper.shape_reward(reward)
+        else:
+            shaped_reward = reward
+
         self.buffer.add(
             observation=observation,
             action=action,
-            reward=reward,
+            reward=shaped_reward,
             value=info['value'],
             log_prob=info['log_prob'],
             done=done
@@ -652,6 +689,74 @@ class OptionsCLSTMPPOAgent:
             'volatility_target': volatility_target,
             'volume_target': volume_target
         })
+
+    def adjust_action_with_greeks(
+        self,
+        action: int,
+        portfolio_greeks: Dict[str, float],
+        new_position_greeks: Dict[str, float]
+    ) -> int:
+        """
+        OPTIMIZATION: Adjust action based on portfolio Greeks
+        Reduces position size if Greeks exposure is too high
+        """
+        if not self.use_greeks_sizing or not hasattr(self, 'greeks_sizer'):
+            return action
+
+        # Decode action to get position size
+        # Actions 1-10 = buy calls, 11-20 = buy puts, 21-30 = sell
+        if action == 0 or action > 20:
+            return action  # Hold or sell actions don't need adjustment
+
+        # Map action to position size (1%, 2%, 5%, 10%, 20%)
+        position_sizes = [0.01, 0.02, 0.05, 0.10, 0.20]
+        action_type = action // 10  # 0 = calls, 1 = puts
+        size_idx = (action % 10) - 1
+
+        if size_idx < 0 or size_idx >= len(position_sizes):
+            return action
+
+        base_size = position_sizes[size_idx]
+
+        # Adjust size based on Greeks
+        adjusted_size = self.greeks_sizer.adjust_position_size(
+            base_size, portfolio_greeks, new_position_greeks
+        )
+
+        # Find closest position size
+        closest_idx = min(range(len(position_sizes)),
+                         key=lambda i: abs(position_sizes[i] - adjusted_size))
+
+        # Reconstruct action
+        adjusted_action = action_type * 10 + closest_idx + 1
+
+        if adjusted_action != action:
+            logger.debug(f"Greeks adjustment: action {action} → {adjusted_action}")
+
+        return adjusted_action
+
+    def check_expiration_close(
+        self,
+        position: Dict
+    ) -> Tuple[bool, str]:
+        """
+        OPTIMIZATION: Check if position should be closed due to expiration
+        """
+        if not self.use_expiration_management or not hasattr(self, 'expiration_manager'):
+            return False, ""
+
+        days_to_expiry = position.get('days_to_expiry', 999)
+        moneyness = position.get('moneyness', 0.0)
+        option_type = position.get('type', 'call')
+
+        return self.expiration_manager.should_close_position(
+            days_to_expiry, moneyness, option_type
+        )
+
+    def reset_episode(self):
+        """Reset episode-specific components"""
+        if self.use_sharpe_shaping and hasattr(self, 'sharpe_shaper'):
+            self.sharpe_shaper.reset()
     
     def _compute_gae(
         self,

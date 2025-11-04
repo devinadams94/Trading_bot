@@ -444,11 +444,81 @@ class OptimizedHistoricalOptionsDataLoader:
 
             # Use sync rate limiting since this is calling sync API
             self._rate_limit()
-            options_chain = self.options_data_client.get_option_chain(chain_request)
 
-            if not options_chain or options_chain.empty:
-                logger.warning(f"No options chain data for {symbol}")
+            # Log the request details for debugging
+            logger.debug(f"Fetching options chain for {symbol} from {start_date.date()} to {(end_date + timedelta(days=45)).date()}")
+
+            try:
+                options_chain = self.options_data_client.get_option_chain(chain_request)
+            except Exception as api_error:
+                logger.error(f"API error fetching options chain for {symbol}: {type(api_error).__name__}: {api_error}")
+                logger.info(f"Falling back to simulated data for {symbol}")
                 return []
+
+            # Check if options_chain is valid
+            if not options_chain:
+                logger.warning(f"No options chain data returned from API for {symbol}")
+                logger.info(f"This may be due to: 1) Demo API keys, 2) No options available for this symbol, 3) API permissions")
+                return []
+
+            # Convert to list - Alpaca returns dict with option symbols as keys
+            chain_list = []
+
+            logger.debug(f"Options chain type: {type(options_chain)}")
+            logger.debug(f"Has 'options' attr: {hasattr(options_chain, 'options')}")
+            logger.debug(f"Is dict: {isinstance(options_chain, dict)}")
+
+            if hasattr(options_chain, 'options'):
+                # If it has an 'options' attribute
+                chain_list = options_chain.options
+                logger.debug(f"Extracted from .options attribute: {len(chain_list)} items")
+            elif isinstance(options_chain, dict):
+                # Alpaca returns dict like: {'SPY251104C00635000': OptionsSnapshot(...), ...}
+                logger.debug(f"Processing dict with {len(options_chain)} keys")
+                logger.debug(f"First 3 keys: {list(options_chain.keys())[:3]}")
+
+                # Convert to list of dicts with symbol and data
+                for option_symbol, option_data in options_chain.items():
+                    # option_data can be either a dict or an OptionsSnapshot object
+                    if isinstance(option_data, dict):
+                        # Dict format
+                        option_dict = {
+                            'symbol': option_symbol,
+                            'strike_price': self._extract_strike_from_symbol(option_symbol),
+                            'expiration_date': self._extract_expiration_from_symbol(option_symbol),
+                            'type': 'call' if 'C' in option_symbol else 'put',
+                            'latest_quote': option_data.get('latest_quote', {}),
+                            'latest_trade': option_data.get('latest_trade', {}),
+                            'greeks': option_data.get('greeks'),
+                            'implied_volatility': option_data.get('implied_volatility')
+                        }
+                        chain_list.append(option_dict)
+                    elif hasattr(option_data, 'symbol'):
+                        # OptionsSnapshot object format
+                        option_dict = {
+                            'symbol': option_symbol,
+                            'strike_price': self._extract_strike_from_symbol(option_symbol),
+                            'expiration_date': self._extract_expiration_from_symbol(option_symbol),
+                            'type': 'call' if 'C' in option_symbol else 'put',
+                            'latest_quote': option_data.latest_quote if hasattr(option_data, 'latest_quote') else {},
+                            'latest_trade': option_data.latest_trade if hasattr(option_data, 'latest_trade') else {},
+                            'greeks': option_data.greeks if hasattr(option_data, 'greeks') else None,
+                            'implied_volatility': option_data.implied_volatility if hasattr(option_data, 'implied_volatility') else None
+                        }
+                        chain_list.append(option_dict)
+
+                logger.debug(f"Converted to list: {len(chain_list)} options")
+            else:
+                chain_list = list(options_chain) if options_chain else []
+                logger.debug(f"Converted to list (fallback): {len(chain_list)} items")
+
+            if not chain_list:
+                logger.warning(f"No options in chain for {symbol}")
+                logger.info(f"Options chain object type: {type(options_chain)}")
+                logger.info(f"Options chain keys (first 5): {list(options_chain.keys())[:5] if isinstance(options_chain, dict) else 'N/A'}")
+                return []
+
+            logger.info(f"✅ Found {len(chain_list)} options in chain for {symbol}")
 
             # For each day in our range, get options data
             current_date = start_date
@@ -465,7 +535,7 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 # Filter options chain for relevant strikes and expirations
                 relevant_options = self._filter_options_chain(
-                    options_chain, stock_price, current_date
+                    chain_list, stock_price, current_date
                 )
 
                 # Get historical bars for these options
@@ -582,28 +652,102 @@ class OptimizedHistoricalOptionsDataLoader:
 
         return None
 
+    def _extract_strike_from_symbol(self, option_symbol: str) -> float:
+        """
+        Extract strike price from option symbol
+        Format: SPY251104C00635000 -> 635.00
+        Last 8 digits represent strike * 1000
+        """
+        try:
+            # Option symbol format: SYMBOL + YYMMDD + C/P + 8-digit strike
+            # Example: SPY251104C00635000 -> strike = 635.00
+            strike_str = option_symbol[-8:]  # Last 8 digits
+            strike = float(strike_str) / 1000.0
+            return strike
+        except Exception as e:
+            logger.debug(f"Error extracting strike from {option_symbol}: {e}")
+            return 0.0
+
+    def _extract_expiration_from_symbol(self, option_symbol: str) -> datetime:
+        """
+        Extract expiration date from option symbol
+        Format: SPY251104C00635000 -> 2025-11-04
+        Characters after underlying symbol: YYMMDD
+        """
+        try:
+            # Find where the date starts (after the underlying symbol)
+            # Look for 6 consecutive digits followed by C or P
+            import re
+            match = re.search(r'(\d{6})[CP]', option_symbol)
+            if match:
+                date_str = match.group(1)
+                year = 2000 + int(date_str[0:2])
+                month = int(date_str[2:4])
+                day = int(date_str[4:6])
+                return datetime(year, month, day)
+        except Exception as e:
+            logger.debug(f"Error extracting expiration from {option_symbol}: {e}")
+
+        # Default to 30 days from now
+        return datetime.now() + timedelta(days=30)
+
     def _filter_options_chain(self, options_chain, stock_price: float, current_date: datetime) -> List[Dict]:
         """Filter options chain for relevant strikes and expirations"""
         filtered_options = []
 
         try:
-            # Filter by strike price (within ±20% of current stock price)
-            min_strike = stock_price * 0.8
-            max_strike = stock_price * 1.2
+            # Filter by strike price (within ±10% of current stock price)
+            min_strike = stock_price * 0.9
+            max_strike = stock_price * 1.1
 
-            # Filter by expiration (7-45 days from current date)
+            # Filter by expiration (7-60 days from current date)
             min_expiry = current_date + timedelta(days=7)
-            max_expiry = current_date + timedelta(days=45)
+            max_expiry = current_date + timedelta(days=60)
 
-            for _, option in options_chain.iterrows():
-                if (min_strike <= option['strike_price'] <= max_strike and
-                    min_expiry.date() <= option['expiration_date'] <= max_expiry.date()):
-                    filtered_options.append({
-                        'symbol': option['symbol'],
-                        'strike_price': option['strike_price'],
-                        'expiration_date': option['expiration_date'],
-                        'type': option['type']
-                    })
+            # Handle both list and DataFrame formats
+            if isinstance(options_chain, list):
+                # List of option objects
+                for option in options_chain:
+                    # Extract fields from option object
+                    if hasattr(option, 'strike_price'):
+                        strike = option.strike_price
+                        expiry = option.expiration_date
+                        symbol = option.symbol
+                        opt_type = option.type
+                    elif isinstance(option, dict):
+                        strike = option.get('strike_price')
+                        expiry = option.get('expiration_date')
+                        symbol = option.get('symbol')
+                        opt_type = option.get('type')
+                    else:
+                        continue
+
+                    # Convert expiry to date if needed
+                    if isinstance(expiry, str):
+                        expiry = pd.to_datetime(expiry).date()
+                    elif isinstance(expiry, datetime):
+                        expiry = expiry.date()
+
+                    if (strike and expiry and
+                        min_strike <= strike <= max_strike and
+                        min_expiry.date() <= expiry <= max_expiry.date()):
+                        filtered_options.append({
+                            'symbol': symbol,
+                            'strike_price': strike,
+                            'expiration_date': expiry,
+                            'type': opt_type
+                        })
+            else:
+                # DataFrame format (legacy)
+                for _, option in options_chain.iterrows():
+                    if (min_strike <= option['strike_price'] <= max_strike and
+                        min_expiry.date() <= option['expiration_date'] <= max_expiry.date()):
+                        filtered_options.append({
+                            'symbol': option['symbol'],
+                            'strike_price': option['strike_price'],
+                            'expiration_date': option['expiration_date'],
+                            'type': option['type']
+                        })
 
         except Exception as e:
             logger.debug(f"Error filtering options chain: {e}")
@@ -737,8 +881,8 @@ class OptimizedHistoricalOptionsDataLoader:
             # Filter to most liquid contracts (near the money)
             filtered_contracts = [
                 c for c in contracts
-                if abs(float(c['strike_price']) - stock_price) / stock_price < 0.07  # Within 7% of stock price (tighter filter)
-            ][:100]  # Limit to 100 most relevant contracts per day
+                if abs(float(c['strike_price']) - stock_price) / stock_price < 0.10  # Within 10% of stock price (expanded filter)
+            ][:150]  # Limit to 150 most relevant contracts per day
             
             # For training purposes, use simulated market data based on contract properties
             # This avoids hundreds of API calls and rate limiting issues
@@ -842,8 +986,8 @@ class OptimizedHistoricalOptionsDataLoader:
             'underlying_symbols': symbol,
             'expiration_date_gte': expiration_start.strftime('%Y-%m-%d'),
             'expiration_date_lte': expiration_end.strftime('%Y-%m-%d'),
-            'strike_price_gte': stock_price * 0.93,  # Tighter range for 7% moneyness
-            'strike_price_lte': stock_price * 1.07,  # Tighter range for 7% moneyness
+            'strike_price_gte': stock_price * 0.90,  # Expanded range for 10% moneyness
+            'strike_price_lte': stock_price * 1.10,  # Expanded range for 10% moneyness
             'limit': 500,  # Increased to fetch more contracts
             'status': 'active'
         }

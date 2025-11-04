@@ -95,3 +95,20 @@ research_paper.pdf
 live_trading_ppo_lstm.py
 models/
 
+fix_training_environment.sh
+TRAINING_READINESS_SUMMARY.md
+TRAINING_ENVIRONMENT_VERIFICATION.md
+=0.8.0
+=3.0.0
+ALPACA_DATA_FIX.md
+OPTIMIZATION_IMPLEMENTATIONS.md
+OPTIMIZATIONS_COMPLETE.md
+check_gpu_setup.py
+clear_cache_and_verify.sh
+COST_CALCULATOR_UPDATE.md
+DATA_FLOW_SUMMARY.md
+GPU_COMPARISON_2025.md
+ossh
+ossh.pub
+train_distributed_clstm_ppo.py
+train_ensemble.py

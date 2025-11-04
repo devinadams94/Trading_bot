@@ -234,45 +234,184 @@ class GPUOptimizer:
         return optimal
 
 
-def distributed_training_wrapper(rank: int, world_size: int, train_fn: Callable, *args, **kwargs):
-    """
-    Wrapper for distributed training
-    Args:
-        rank: Process rank
-        world_size: Total number of processes
-        train_fn: Training function to run
-        *args, **kwargs: Arguments for training function
-    """
-    try:
-        # Setup distributed training
-        optimizer = GPUOptimizer()
-        optimizer.setup_distributed(rank, world_size)
-        
-        # Run training function
-        train_fn(rank, world_size, *args, **kwargs)
-        
-    finally:
-        # Cleanup
-        optimizer.cleanup_distributed()
-
-
-def launch_distributed_training(train_fn: Callable, world_size: int, *args, **kwargs):
+def launch_distributed_training(train_fn: Callable, world_size: int = -1, *args, **kwargs):
     """
     Launch distributed training across multiple GPUs
     Args:
         train_fn: Training function (must accept rank and world_size as first two args)
-        world_size: Number of GPUs to use
+        world_size: Number of GPUs to use (-1 for all available, 0 for CPU)
         *args, **kwargs: Additional arguments for training function
+
+    Example:
+        def my_train_fn(rank, world_size, config):
+            # Setup distributed
+            setup_distributed(rank, world_size)
+
+            # Create model and wrap with DDP
+            model = MyModel().to(rank)
+            model = DDP(model, device_ids=[rank])
+
+            # Training loop
+            ...
+
+            # Cleanup
+            dist.destroy_process_group()
+
+        # Launch on all GPUs
+        launch_distributed_training(my_train_fn, world_size=-1, config={})
     """
-    if world_size <= 1:
-        # Single GPU or CPU training
+    # Determine number of GPUs to use
+    available_gpus = torch.cuda.device_count()
+
+    if world_size == -1:
+        # Use all available GPUs
+        world_size = available_gpus
+    elif world_size == 0:
+        # CPU training
+        logger.info("🔧 Running on CPU (no GPU acceleration)")
+        train_fn(0, 1, *args, **kwargs)
+        return
+    else:
+        # Use specified number of GPUs
+        world_size = min(world_size, available_gpus)
+
+    if world_size == 0:
+        logger.warning("⚠️ No GPUs available, falling back to CPU")
+        train_fn(0, 1, *args, **kwargs)
+        return
+
+    logger.info(f"🚀 Launching distributed training on {world_size} GPU(s)")
+    logger.info(f"   Available GPUs: {available_gpus}")
+
+    if world_size == 1:
+        # Single GPU training (no distributed setup needed)
+        logger.info("🔥 Single GPU training mode")
         train_fn(0, 1, *args, **kwargs)
     else:
         # Multi-GPU distributed training
+        logger.info(f"🔥 Multi-GPU distributed training mode ({world_size} GPUs)")
         mp.spawn(
-            distributed_training_wrapper,
-            args=(world_size, train_fn, *args),
+            train_fn,
+            args=(world_size, *args),
             nprocs=world_size,
             join=True
         )
+
+    logger.info("✅ Distributed training completed")
+
+
+def get_gpu_info() -> dict:
+    """
+    Get detailed information about available GPUs
+    Returns:
+        Dict with GPU information
+    """
+    if not torch.cuda.is_available():
+        return {
+            'available': False,
+            'count': 0,
+            'devices': []
+        }
+
+    gpu_count = torch.cuda.device_count()
+    devices = []
+
+    for i in range(gpu_count):
+        props = torch.cuda.get_device_properties(i)
+        devices.append({
+            'id': i,
+            'name': props.name,
+            'total_memory_gb': props.total_memory / 1e9,
+            'compute_capability': f"{props.major}.{props.minor}",
+            'multi_processor_count': props.multi_processor_count
+        })
+
+    return {
+        'available': True,
+        'count': gpu_count,
+        'devices': devices
+    }
+
+
+def print_gpu_info():
+    """Print detailed GPU information"""
+    info = get_gpu_info()
+
+    if not info['available']:
+        print("❌ No GPUs available")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"🔥 GPU Information")
+    print(f"{'='*80}")
+    print(f"Total GPUs: {info['count']}")
+    print()
+
+    for device in info['devices']:
+        print(f"GPU {device['id']}: {device['name']}")
+        print(f"  Memory: {device['total_memory_gb']:.2f} GB")
+        print(f"  Compute Capability: {device['compute_capability']}")
+        print(f"  Multiprocessors: {device['multi_processor_count']}")
+        print()
+
+    print(f"{'='*80}\n")
+
+
+def estimate_training_speedup(world_size: int, efficiency: float = 0.85) -> dict:
+    """
+    Estimate training speedup with multi-GPU
+    Args:
+        world_size: Number of GPUs
+        efficiency: Scaling efficiency (0.0-1.0, default 0.85)
+    Returns:
+        Dict with speedup estimates
+    """
+    if world_size <= 1:
+        return {
+            'world_size': world_size,
+            'theoretical_speedup': 1.0,
+            'actual_speedup': 1.0,
+            'efficiency': 1.0
+        }
+
+    # Theoretical speedup (linear)
+    theoretical_speedup = world_size
+
+    # Actual speedup (accounting for communication overhead)
+    # Efficiency typically decreases with more GPUs
+    # Common scaling: 1 GPU = 100%, 2 GPU = 95%, 4 GPU = 90%, 8 GPU = 85%
+    actual_efficiency = efficiency ** (np.log2(world_size))
+    actual_speedup = world_size * actual_efficiency
+
+    return {
+        'world_size': world_size,
+        'theoretical_speedup': theoretical_speedup,
+        'actual_speedup': actual_speedup,
+        'efficiency': actual_efficiency,
+        'overhead_percent': (1 - actual_efficiency) * 100
+    }
+
+
+def print_training_speedup_estimates():
+    """Print estimated training speedup for different GPU configurations"""
+    print(f"\n{'='*80}")
+    print(f"⚡ Estimated Training Speedup (Multi-GPU)")
+    print(f"{'='*80}")
+    print(f"{'GPUs':<8} {'Theoretical':<15} {'Actual':<15} {'Efficiency':<12} {'Overhead':<10}")
+    print(f"{'-'*80}")
+
+    for gpus in [1, 2, 4, 8]:
+        est = estimate_training_speedup(gpus)
+        print(f"{est['world_size']:<8} "
+              f"{est['theoretical_speedup']:.2f}x{'':<11} "
+              f"{est['actual_speedup']:.2f}x{'':<11} "
+              f"{est['efficiency']*100:.1f}%{'':<8} "
+              f"{est['overhead_percent']:.1f}%")
+
+    print(f"{'='*80}")
+    print(f"Note: Actual speedup depends on model size, batch size, and communication overhead")
+    print(f"{'='*80}\n")
+
+
+259
 
