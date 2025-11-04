@@ -691,14 +691,32 @@ class OptimizedHistoricalOptionsDataLoader:
             if hasattr(options_chain, 'options'):
                 # If it has an 'options' attribute
                 chain_list = options_chain.options
-                logger.debug(f"Extracted from .options attribute: {len(chain_list)} items")
+                msg = f"      📋 Extracted {len(chain_list)} options from .options attribute"
+                print(msg, flush=True)
+                logger.debug(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
             elif isinstance(options_chain, dict):
                 # Alpaca returns dict like: {'SPY251104C00635000': OptionsSnapshot(...), ...}
-                logger.debug(f"Processing dict with {len(options_chain)} keys")
-                logger.debug(f"First 3 keys: {list(options_chain.keys())[:3]}")
+                total_options = len(options_chain)
+                msg = f"      📋 Processing dict with {total_options} options contracts..."
+                print(msg, flush=True)
+                logger.debug(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
 
                 # Convert to list of dicts with symbol and data
+                processed_count = 0
                 for option_symbol, option_data in options_chain.items():
+                    processed_count += 1
+
+                    # Show progress every 1000 options
+                    if processed_count % 1000 == 0:
+                        msg = f"      ⏳ Processed {processed_count}/{total_options} options..."
+                        print(msg, flush=True)
+                        logger.debug(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
                     # option_data can be either a dict or an OptionsSnapshot object
                     if isinstance(option_data, dict):
                         # Dict format
@@ -727,25 +745,68 @@ class OptimizedHistoricalOptionsDataLoader:
                         }
                         chain_list.append(option_dict)
 
-                logger.debug(f"Converted to list: {len(chain_list)} options")
+                msg = f"      ✅ Converted {len(chain_list)} options to internal format"
+                print(msg, flush=True)
+                logger.debug(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
             else:
                 chain_list = list(options_chain) if options_chain else []
-                logger.debug(f"Converted to list (fallback): {len(chain_list)} items")
+                msg = f"      📋 Converted to list (fallback): {len(chain_list)} items"
+                print(msg, flush=True)
+                logger.debug(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
 
             if not chain_list:
-                logger.warning(f"No options in chain for {symbol}")
-                logger.info(f"Options chain object type: {type(options_chain)}")
-                logger.info(f"Options chain keys (first 5): {list(options_chain.keys())[:5] if isinstance(options_chain, dict) else 'N/A'}")
+                msg = f"      ⚠️ No options in chain for {symbol}"
+                print(msg, flush=True)
+                logger.warning(msg)
+
+                msg = f"      📊 Options chain object type: {type(options_chain)}"
+                print(msg, flush=True)
+                logger.info(msg)
+
+                if isinstance(options_chain, dict):
+                    msg = f"      🔑 Options chain keys (first 5): {list(options_chain.keys())[:5]}"
+                    print(msg, flush=True)
+                    logger.info(msg)
+
+                sys.stdout.flush()
+                sys.stderr.flush()
                 return []
 
-            logger.info(f"✅ Found {len(chain_list)} options in chain for {symbol}")
+            msg = f"      ✅ Found {len(chain_list)} options in chain for {symbol}"
+            print(msg, flush=True)
+            logger.info(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
 
             # For each day in our range, get options data
+            msg = f"      📅 Processing options data for date range ({start_date.date()} to {end_date.date()})..."
+            print(msg, flush=True)
+            logger.info(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+            total_days = (end_date - start_date).days
+            days_processed = 0
+
             current_date = start_date
             while current_date <= end_date:
                 if current_date.weekday() >= 5:  # Skip weekends
                     current_date += timedelta(days=1)
                     continue
+
+                days_processed += 1
+
+                # Show progress every 10 days
+                if days_processed % 10 == 0:
+                    msg = f"      ⏳ Processing day {days_processed}/{total_days} ({current_date.date()})..."
+                    print(msg, flush=True)
+                    logger.debug(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
 
                 # Get stock price for this date
                 stock_price = self._get_stock_price_for_date(stock_data, current_date)
@@ -802,8 +863,24 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 current_date += timedelta(days=1)
 
+            msg = f"      ✅ Completed processing {days_processed} days of options data"
+            print(msg, flush=True)
+            logger.info(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
         except Exception as e:
-            logger.error(f"Error fetching real options data for {symbol}: {e}")
+            msg = f"      ❌ Error fetching real options data for {symbol}: {e}"
+            print(msg, flush=True)
+            logger.error(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+        msg = f"      📊 Returning {len(options_data)} options data points for {symbol}"
+        print(msg, flush=True)
+        logger.info(msg)
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         return options_data
 
