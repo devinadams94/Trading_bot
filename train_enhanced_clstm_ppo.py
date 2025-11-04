@@ -1115,7 +1115,9 @@ class EnhancedCLSTMPPOTrainer:
             # Get action from CLSTM-PPO agent (if not overridden by turbulence)
             if 'action' not in locals():
                 # EXPLORATION: Use epsilon-greedy for first 20% of episodes to encourage exploration
-                epsilon = max(0.0, 0.3 * (1.0 - self.episode / (self.num_episodes * 0.2)))
+                # Use config num_episodes for epsilon decay calculation
+                total_episodes = self.config.get('num_episodes', 1000)
+                epsilon = max(0.0, 0.3 * (1.0 - self.episode / (total_episodes * 0.2)))
                 use_random_action = (np.random.random() < epsilon)
 
                 if use_random_action:
