@@ -782,88 +782,124 @@ class OptimizedHistoricalOptionsDataLoader:
             sys.stdout.flush()
             sys.stderr.flush()
 
-            # For each day in our range, get options data
-            msg = f"      📅 Processing options data for date range ({start_date.date()} to {end_date.date()})..."
+            # OPTIMIZED: Batch fetch all options data at once instead of per-day
+            msg = f"      📅 Fetching options bars for entire date range ({start_date.date()} to {end_date.date()})..."
             print(msg, flush=True)
             logger.info(msg)
             sys.stdout.flush()
             sys.stderr.flush()
 
-            total_days = (end_date - start_date).days
-            days_processed = 0
+            # Extract all unique option symbols from the chain
+            all_option_symbols = [opt['symbol'] for opt in chain_list]
 
-            current_date = start_date
-            while current_date <= end_date:
-                if current_date.weekday() >= 5:  # Skip weekends
-                    current_date += timedelta(days=1)
-                    continue
+            msg = f"      📊 Batching request for {len(all_option_symbols)} option symbols..."
+            print(msg, flush=True)
+            logger.info(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
 
-                days_processed += 1
+            # Batch the symbols into groups (Alpaca may have limits on batch size)
+            batch_size = 100  # Fetch 100 options at a time
+            total_batches = (len(all_option_symbols) + batch_size - 1) // batch_size
 
-                # Show progress every 10 days
-                if days_processed % 10 == 0:
-                    msg = f"      ⏳ Processing day {days_processed}/{total_days} ({current_date.date()})..."
+            for batch_idx in range(0, len(all_option_symbols), batch_size):
+                batch_symbols = all_option_symbols[batch_idx:batch_idx + batch_size]
+                current_batch = (batch_idx // batch_size) + 1
+
+                msg = f"      ⏳ Fetching batch {current_batch}/{total_batches} ({len(batch_symbols)} options)..."
+                print(msg, flush=True)
+                logger.info(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
+
+                try:
+                    # Create batched request for multiple symbols
+                    bars_request = OptionBarsRequest(
+                        symbol_or_symbols=batch_symbols,  # Pass list of symbols
+                        timeframe=TimeFrame.Hour,
+                        start=start_date,
+                        end=end_date
+                    )
+
+                    await self._rate_limit_async()
+
+                    msg = f"      🌐 Calling Alpaca API for batch {current_batch}/{total_batches}..."
                     print(msg, flush=True)
                     logger.debug(msg)
                     sys.stdout.flush()
                     sys.stderr.flush()
 
-                # Get stock price for this date
-                stock_price = self._get_stock_price_for_date(stock_data, current_date)
-                if stock_price is None:
-                    current_date += timedelta(days=1)
+                    # Run blocking API call in thread pool
+                    bars = await asyncio.to_thread(self.options_data_client.get_option_bars, bars_request)
+
+                    msg = f"      📦 Received batch {current_batch}/{total_batches} response"
+                    print(msg, flush=True)
+                    logger.debug(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
+                    if not bars.df.empty:
+                        msg = f"      🔄 Processing {len(bars.df)} bars from batch {current_batch}/{total_batches}..."
+                        print(msg, flush=True)
+                        logger.debug(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+
+                        # Process all bars from this batch
+                        for _, bar in bars.df.iterrows():
+                            # Find the option details from chain_list
+                            option_symbol = bar.get('symbol', None)
+                            if option_symbol:
+                                option_info = next((opt for opt in chain_list if opt['symbol'] == option_symbol), None)
+                                if option_info:
+                                    # Get stock price for this timestamp
+                                    bar_timestamp = bar.name if hasattr(bar, 'name') else bar.get('timestamp')
+                                    stock_price = self._get_stock_price_for_date(stock_data, bar_timestamp)
+
+                                    options_data.append({
+                                        'timestamp': bar_timestamp,
+                                        'symbol': symbol,
+                                        'option_symbol': option_symbol,
+                                        'strike': option_info['strike_price'],
+                                        'expiration': option_info['expiration_date'],
+                                        'option_type': option_info['type'],
+                                        'underlying_price': stock_price if stock_price else 0,
+                                        'open': bar.get('open', 0),
+                                        'high': bar.get('high', 0),
+                                        'low': bar.get('low', 0),
+                                        'close': bar.get('close', 0),
+                                        'volume': bar.get('volume', 0),
+                                        'bid': bar.get('bid', bar.get('close', 0) * 0.98),
+                                        'ask': bar.get('ask', bar.get('close', 0) * 1.02),
+                                        'implied_volatility': bar.get('implied_volatility', 0.3),
+                                        'delta': bar.get('delta', 0.5),
+                                        'gamma': bar.get('gamma', 0.1),
+                                        'theta': bar.get('theta', -0.05),
+                                        'vega': bar.get('vega', 0.2),
+                                        'rho': bar.get('rho', 0.1)
+                                    })
+
+                        msg = f"      ✅ Batch {current_batch}/{total_batches} complete: {len(bars.df)} bars processed"
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    else:
+                        msg = f"      ⚠️ Batch {current_batch}/{total_batches} returned no data"
+                        print(msg, flush=True)
+                        logger.warning(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+
+                except Exception as e:
+                    msg = f"      ❌ Error fetching batch {current_batch}/{total_batches}: {e}"
+                    print(msg, flush=True)
+                    logger.error(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     continue
 
-                # Filter options chain for relevant strikes and expirations
-                relevant_options = self._filter_options_chain(
-                    chain_list, stock_price, current_date
-                )
-
-                # Get historical bars for these options
-                for option in relevant_options:
-                    try:
-                        bars_request = OptionBarsRequest(
-                            symbol_or_symbols=option['symbol'],
-                            timeframe=TimeFrame.Hour,
-                            start=current_date,
-                            end=current_date + timedelta(days=1)
-                        )
-
-                        await self._rate_limit_async()
-                        # Run blocking API call in thread pool
-                        bars = await asyncio.to_thread(self.options_data_client.get_option_bars, bars_request)
-
-                        if not bars.df.empty:
-                            for _, bar in bars.df.iterrows():
-                                options_data.append({
-                                    'timestamp': current_date,
-                                    'symbol': symbol,
-                                    'option_symbol': option['symbol'],
-                                    'strike': option['strike_price'],
-                                    'expiration': option['expiration_date'],
-                                    'option_type': option['type'],
-                                    'underlying_price': stock_price,
-                                    'open': bar['open'],
-                                    'high': bar['high'],
-                                    'low': bar['low'],
-                                    'close': bar['close'],
-                                    'volume': bar['volume'],
-                                    'bid': bar.get('bid', bar['close'] * 0.98),
-                                    'ask': bar.get('ask', bar['close'] * 1.02),
-                                    'implied_volatility': bar.get('implied_volatility', 0.3),
-                                    'delta': bar.get('delta', 0.5),
-                                    'gamma': bar.get('gamma', 0.1),
-                                    'theta': bar.get('theta', -0.05),
-                                    'vega': bar.get('vega', 0.2),
-                                    'rho': bar.get('rho', 0.1)
-                                })
-                    except Exception as e:
-                        logger.debug(f"Error fetching bars for option {option['symbol']}: {e}")
-                        continue
-
-                current_date += timedelta(days=1)
-
-            msg = f"      ✅ Completed processing {days_processed} days of options data"
+            msg = f"      ✅ Completed fetching options data ({len(options_data)} data points)"
             print(msg, flush=True)
             logger.info(msg)
             sys.stdout.flush()
