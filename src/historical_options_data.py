@@ -459,28 +459,38 @@ class OptimizedHistoricalOptionsDataLoader:
             start_date = end_date - timedelta(days=7)
 
         total_symbols = len(symbols)
-        logger.info(f"📊 Loading historical options data for {total_symbols} symbols from {start_date.date()} to {end_date.date()}")
-        logger.info(f"")
+        msg = f"📊 Loading historical options data for {total_symbols} symbols from {start_date.date()} to {end_date.date()}\n"
+        print(msg, flush=True)
+        logger.info(msg)
         sys.stdout.flush()
         sys.stderr.flush()
 
         result = {}
 
         # First, load stock data for underlying prices
-        logger.info(f"📈 Loading underlying stock prices first...")
+        msg = f"📈 Loading underlying stock prices first..."
+        print(msg, flush=True)
+        logger.info(msg)
         sys.stdout.flush()
         sys.stderr.flush()
+
         stock_data = await self.load_historical_stock_data(symbols, start_date, end_date)
-        logger.info(f"")
+
+        msg = ""
+        print(msg, flush=True)
+        logger.info(msg)
 
         # Process each symbol
-        logger.info(f"📊 Processing options chains for {total_symbols} symbols...")
-        logger.info(f"")
+        msg = f"📊 Processing options chains for {total_symbols} symbols...\n"
+        print(msg, flush=True)
+        logger.info(msg)
         sys.stdout.flush()
         sys.stderr.flush()
 
         for idx, sym in enumerate(symbols, 1):
-            logger.info(f"  [{idx}/{total_symbols}] 📥 Fetching options chain for {sym}...")
+            msg = f"  [{idx}/{total_symbols}] 📥 Fetching options chain for {sym}..."
+            print(msg, flush=True)
+            logger.info(msg)
             sys.stdout.flush()
             sys.stderr.flush()
             try:
@@ -1327,17 +1337,27 @@ class OptimizedHistoricalOptionsDataLoader:
             )
 
             if stock_data:
-                logger.info(f"")
-                logger.info(f"✅ Stock data loaded for {len(stock_data)}/{total_symbols} symbols")
-                logger.info(f"")
+                msg = f"\n✅ Stock data loaded for {len(stock_data)}/{total_symbols} symbols\n"
+                print(msg, flush=True)
+                logger.info(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
                 result.update(stock_data)
             else:
-                logger.warning("⚠️ No stock data loaded")
-            
+                msg = "⚠️ No stock data loaded"
+                print(msg, flush=True)
+                logger.warning(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
+
             # Try to load options data if we have stock data
             if result:
-                logger.info("📊 STEP 2/2: Loading options data...")
-                logger.info("")
+                msg = "📊 STEP 2/2: Loading options data..."
+                print(msg, flush=True)
+                logger.info(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
+
                 try:
                     options_data = await self.load_historical_options_data(
                         symbols=symbols,
@@ -1347,9 +1367,12 @@ class OptimizedHistoricalOptionsDataLoader:
                     )
 
                     if options_data:
-                        logger.info(f"")
-                        logger.info(f"✅ Options data loaded for {len(options_data)}/{total_symbols} symbols")
-                        logger.info(f"")
+                        msg = f"\n✅ Options data loaded for {len(options_data)}/{total_symbols} symbols\n"
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+
                         # Merge options data with stock data
                         for symbol in symbols:
                             if symbol in result and symbol in options_data:
@@ -1361,44 +1384,70 @@ class OptimizedHistoricalOptionsDataLoader:
                                     stock_df['options_volume'] = len(options_data[symbol]) if options_data[symbol] else 0
                                     result[symbol] = stock_df
                     else:
-                        logger.info("ℹ️ No options data available, using stock data only")
-                        
+                        msg = "ℹ️ No options data available, using stock data only"
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+
                 except Exception as e:
-                    logger.warning(f"⚠️ Options data loading failed: {e}")
-                    logger.info("ℹ️ Continuing with stock data only")
-            
+                    msg = f"⚠️ Options data loading failed: {e}"
+                    print(msg, flush=True)
+                    logger.warning(msg)
+
+                    msg = "ℹ️ Continuing with stock data only"
+                    print(msg, flush=True)
+                    logger.info(msg)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
             # Validate and clean the data
-            logger.info("🔍 Validating data quality...")
+            msg = "🔍 Validating data quality..."
+            print(msg, flush=True)
+            logger.info(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
             validated_result = {}
             for symbol, data in result.items():
                 if isinstance(data, pd.DataFrame) and not data.empty:
                     # Basic data validation
                     if len(data) > 10:  # Minimum data points
                         validated_result[symbol] = data
-                        logger.debug(f"✅ Validated {len(data)} data points for {symbol}")
+                        msg = f"  ✅ Validated {len(data)} data points for {symbol}"
+                        print(msg, flush=True)
+                        logger.debug(msg)
                     else:
-                        logger.warning(f"⚠️ Insufficient data for {symbol}: {len(data)} points")
+                        msg = f"  ⚠️ Insufficient data for {symbol}: {len(data)} points"
+                        print(msg, flush=True)
+                        logger.warning(msg)
                 else:
-                    logger.warning(f"⚠️ Invalid data format for {symbol}")
+                    msg = f"  ⚠️ Invalid data format for {symbol}"
+                    print(msg, flush=True)
+                    logger.warning(msg)
 
             if validated_result:
-                logger.info(f"")
-                logger.info(f"{'='*80}")
-                logger.info(f"✅ DATA LOADING COMPLETE")
-                logger.info(f"{'='*80}")
-                logger.info(f"  Successfully loaded: {len(validated_result)}/{total_symbols} symbols")
                 total_rows = sum(len(df) for df in validated_result.values())
-                logger.info(f"  Total data points: {total_rows:,}")
-                logger.info(f"  Ready for training!")
-                logger.info(f"{'='*80}")
-                logger.info(f"")
+                msg = f"\n{'='*80}\n✅ DATA LOADING COMPLETE\n{'='*80}\n  Successfully loaded: {len(validated_result)}/{total_symbols} symbols\n  Total data points: {total_rows:,}\n  Ready for training!\n{'='*80}\n"
+                print(msg, flush=True)
+                logger.info(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
                 return validated_result
             else:
-                logger.error("❌ No valid data loaded for any symbol")
+                msg = "❌ No valid data loaded for any symbol"
+                print(msg, flush=True)
+                logger.error(msg)
+                sys.stdout.flush()
+                sys.stderr.flush()
                 return {}
-                
+
         except Exception as e:
-            logger.error(f"❌ Critical error in data loading: {e}")
+            msg = f"❌ Critical error in data loading: {e}"
+            print(msg, flush=True)
+            logger.error(msg)
+            sys.stdout.flush()
+            sys.stderr.flush()
             return {}
 
 class HistoricalOptionsEnvironment:
