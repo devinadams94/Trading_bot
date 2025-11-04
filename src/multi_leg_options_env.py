@@ -182,19 +182,24 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
             'premium_received': premium_received,
             'transaction_cost': transaction_cost
         })
-        
+
+        # Increment trade counter
+        self.episode_trades += 1
+
         # Move to next step
         self.current_step += 1
         done = self.current_step >= len(self.market_data) - 1
-        
+
         # Calculate reward (premium received is profit)
         reward = premium_received * self.reward_scaling
-        
+
         return self._get_observation(), reward, done, {
             'action': 'covered_call',
             'strike': strike_price,
             'premium_received': premium_received,
-            'transaction_cost': transaction_cost
+            'transaction_cost': transaction_cost,
+            'episode_trades': self.episode_trades,
+            'num_trades': 1
         }
     
     def _execute_cash_secured_put(self, action: int, current_price: float, current_data: Dict):
@@ -249,20 +254,25 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
             'capital_reserved': required_capital,
             'transaction_cost': transaction_cost
         })
-        
+
+        # Increment trade counter
+        self.episode_trades += 1
+
         # Move to next step
         self.current_step += 1
         done = self.current_step >= len(self.market_data) - 1
-        
+
         # Calculate reward
         reward = premium_received * self.reward_scaling
-        
+
         return self._get_observation(), reward, done, {
             'action': 'cash_secured_put',
             'strike': strike_price,
             'premium_received': premium_received,
             'capital_reserved': required_capital,
-            'transaction_cost': transaction_cost
+            'transaction_cost': transaction_cost,
+            'episode_trades': self.episode_trades,
+            'num_trades': 1
         }
     
     def _execute_multi_leg_strategy(self, action: int):
@@ -322,22 +332,25 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
             'max_loss': strategy.max_loss,
             'legs': strategy.legs
         })
-        
+
         self.multi_leg_trades += 1
-        
+        self.episode_trades += 1  # Also increment episode trades
+
         # Move to next step
         self.current_step += 1
         done = self.current_step >= len(self.market_data) - 1
-        
+
         # Calculate reward (negative for capital deployed, will be positive if profitable)
         reward = -strategy.capital_required * self.reward_scaling * 0.1  # Small penalty for capital usage
-        
+
         return self._get_observation(), reward, done, {
             'action': 'multi_leg_strategy',
             'strategy_type': strategy.strategy_type.value,
             'capital_required': strategy.capital_required,
             'max_profit': strategy.max_profit,
-            'max_loss': strategy.max_loss
+            'max_loss': strategy.max_loss,
+            'episode_trades': self.episode_trades,
+            'num_trades': 1
         }
     
     def reset(self):
