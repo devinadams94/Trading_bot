@@ -115,8 +115,12 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
         """Execute covered call or cash-secured put"""
         if len(self.market_data) == 0:
             return self._get_observation(), 0, False, {}
-        
-        current_data = self.market_data[self.current_step]
+
+        # Get current market data using parent class method
+        current_data = self._get_current_market_data()
+        if current_data is None:
+            return self._get_observation(), 0, False, {}
+
         current_price = current_data.get('close', 100.0)
         
         # Covered calls (31-45)
@@ -265,8 +269,12 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
         """Execute multi-leg strategy (spreads, straddles, etc.)"""
         if len(self.market_data) == 0:
             return self._get_observation(), 0, False, {}
-        
-        current_data = self.market_data[self.current_step]
+
+        # Get current market data using parent class method
+        current_data = self._get_current_market_data()
+        if current_data is None:
+            return self._get_observation(), 0, False, {}
+
         current_price = current_data.get('close', 100.0)
         
         # Determine strategy type and build it

@@ -283,11 +283,14 @@ class OptimizedHistoricalOptionsDataLoader:
         total_symbols = len(symbols)
 
         logger.info(f"📊 Loading stock data for {total_symbols} symbols...")
+        logger.info(f"   Date range: {start_date.date()} to {end_date.date()}")
+        logger.info(f"   Timeframe: {timeframe}")
+        logger.info(f"")
         sys.stdout.flush()
         sys.stderr.flush()
 
         for idx, symbol in enumerate(symbols, 1):
-            logger.info(f"  [{idx}/{total_symbols}] Loading {symbol}...")
+            logger.info(f"  [{idx}/{total_symbols}] 📥 Downloading {symbol}...")
             sys.stdout.flush()
             sys.stderr.flush()
             try:
@@ -296,15 +299,22 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 # Check cache first
                 if self._is_cache_valid(cache_key) and os.path.exists(cache_path):
+                    logger.info(f"  [{idx}/{total_symbols}] 💾 Loading {symbol} from cache...")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     with open(cache_path, 'rb') as f:
                         data = pickle.load(f)
-                    logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol} loaded from cache ({len(data)} rows)")
+                    logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (cached)")
                     sys.stdout.flush()
                     sys.stderr.flush()
                     result[symbol] = data
                     continue
 
                 # Fetch from API
+                logger.info(f"  [{idx}/{total_symbols}] 🌐 Calling Alpaca API for {symbol}...")
+                sys.stdout.flush()
+                sys.stderr.flush()
+
                 await self._rate_limit_async()
 
                 request = StockBarsRequest(
@@ -315,13 +325,25 @@ class OptimizedHistoricalOptionsDataLoader:
                 )
 
                 # Run blocking API call in thread pool to not block event loop
+                logger.info(f"  [{idx}/{total_symbols}] ⏳ Waiting for API response...")
+                sys.stdout.flush()
+                sys.stderr.flush()
                 bars = await asyncio.to_thread(self.stock_data_client.get_stock_bars, request)
+                logger.info(f"  [{idx}/{total_symbols}] 📦 Received API response for {symbol}")
+                sys.stdout.flush()
+                sys.stderr.flush()
 
                 if bars.df.empty:
-                    logger.warning(f"No stock data returned for {symbol}")
+                    logger.warning(f"  [{idx}/{total_symbols}] ⚠️ {symbol}: No data returned from API")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     continue
 
                 # Process and validate data
+                logger.info(f"  [{idx}/{total_symbols}] 🔄 Processing {len(bars.df)} bars for {symbol}...")
+                sys.stdout.flush()
+                sys.stderr.flush()
+
                 data = bars.df.reset_index()
                 data['symbol'] = symbol
 
@@ -333,7 +355,13 @@ class OptimizedHistoricalOptionsDataLoader:
                 else:
                     logger.info(f"  [{idx}/{total_symbols}] ✅ {symbol}: {len(data)} bars (quality: {quality_metrics.quality_score:.2f})")
 
+                sys.stdout.flush()
+                sys.stderr.flush()
+
                 # Cache the data
+                logger.info(f"  [{idx}/{total_symbols}] 💾 Caching {symbol} data...")
+                sys.stdout.flush()
+                sys.stderr.flush()
                 with open(cache_path, 'wb') as f:
                     pickle.dump(data, f)
 
@@ -349,7 +377,23 @@ class OptimizedHistoricalOptionsDataLoader:
                 result[symbol] = data
 
             except Exception as e:
-                logger.error(f"  [{idx}/{total_symbols}] ❌ {symbol}: {e}")
+                error_msg = str(e)
+                logger.error(f"  [{idx}/{total_symbols}] ❌ {symbol}: {type(e).__name__}: {error_msg}")
+
+                # Provide helpful context for common errors
+                if "401" in error_msg or "Unauthorized" in error_msg:
+                    logger.error(f"  [{idx}/{total_symbols}] 🔑 API authentication failed - check your API keys")
+                elif "403" in error_msg or "Forbidden" in error_msg:
+                    logger.error(f"  [{idx}/{total_symbols}] 🚫 API access forbidden - check your subscription/permissions")
+                elif "429" in error_msg or "rate limit" in error_msg.lower():
+                    logger.error(f"  [{idx}/{total_symbols}] ⏱️ Rate limit exceeded - waiting before retry...")
+                elif "timeout" in error_msg.lower():
+                    logger.error(f"  [{idx}/{total_symbols}] ⏰ API request timed out")
+                elif "connection" in error_msg.lower():
+                    logger.error(f"  [{idx}/{total_symbols}] 🌐 Network connection error")
+
+                sys.stdout.flush()
+                sys.stderr.flush()
                 continue
 
         self._save_cache_index()
@@ -379,16 +423,29 @@ class OptimizedHistoricalOptionsDataLoader:
 
         total_symbols = len(symbols)
         logger.info(f"📊 Loading historical options data for {total_symbols} symbols from {start_date.date()} to {end_date.date()}")
+        logger.info(f"")
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         result = {}
 
         # First, load stock data for underlying prices
+        logger.info(f"📈 Loading underlying stock prices first...")
+        sys.stdout.flush()
+        sys.stderr.flush()
         stock_data = await self.load_historical_stock_data(symbols, start_date, end_date)
+        logger.info(f"")
 
         # Process each symbol
-        logger.info(f"📈 Processing options chains for {total_symbols} symbols...")
+        logger.info(f"📊 Processing options chains for {total_symbols} symbols...")
+        logger.info(f"")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
         for idx, sym in enumerate(symbols, 1):
-            logger.info(f"  [{idx}/{total_symbols}] Processing options for {sym}...")
+            logger.info(f"  [{idx}/{total_symbols}] 📥 Fetching options chain for {sym}...")
+            sys.stdout.flush()
+            sys.stderr.flush()
             try:
                 cache_key = self._get_cache_key(sym, start_date, end_date, "options")
                 cache_path = os.path.join(self.cache_dir, 'options', f"{cache_key}.pkl")
