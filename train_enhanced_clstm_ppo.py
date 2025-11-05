@@ -763,6 +763,9 @@ class EnhancedCLSTMPPOTrainer:
     def _save_checkpoint(self, checkpoint_type="regular"):
         """Save training checkpoint"""
         try:
+            if self.is_main_process:
+                logger.info(f"💾 Saving {checkpoint_type} checkpoint at episode {self.episode}...")
+
             checkpoint = {
                 'episode': self.episode,
                 'total_episodes_trained': self.total_episodes_trained,
@@ -784,8 +787,12 @@ class EnhancedCLSTMPPOTrainer:
 
             # Save training state
             checkpoint_path = self.checkpoint_dir / "training_state.json"
+            if self.is_main_process:
+                logger.info(f"   Writing training state to: {checkpoint_path}")
             with open(checkpoint_path, 'w') as f:
                 json.dump(checkpoint, f, indent=2)
+            if self.is_main_process:
+                logger.info(f"   ✅ Training state saved ({checkpoint_path.stat().st_size} bytes)")
 
             # Save agent model with appropriate naming
             model_filename = f"model_episode_{self.episode}.pt"
@@ -800,12 +807,23 @@ class EnhancedCLSTMPPOTrainer:
 
             if HAS_CLSTM_PPO and hasattr(self.agent, 'save'):
                 model_path = self.checkpoint_dir / model_filename
+                if self.is_main_process:
+                    logger.info(f"   Saving model to: {model_path}")
                 self.agent.save(str(model_path))
+                if self.is_main_process:
+                    logger.info(f"   ✅ Model saved ({model_path.stat().st_size} bytes)")
             elif hasattr(self.agent, 'action_probs'):
                 # Save simple agent
                 agent_path = self.checkpoint_dir / f"simple_agent_episode_{self.episode}.pkl"
+                if self.is_main_process:
+                    logger.info(f"   Saving simple agent to: {agent_path}")
                 with open(agent_path, 'wb') as f:
                     pickle.dump(self.agent.action_probs, f)
+                if self.is_main_process:
+                    logger.info(f"   ✅ Simple agent saved")
+            else:
+                if self.is_main_process:
+                    logger.warning(f"   ⚠️ No agent save method available (HAS_CLSTM_PPO={HAS_CLSTM_PPO}, has save={hasattr(self.agent, 'save') if hasattr(self, 'agent') else 'no agent'})")
 
             # Update symlinks based on checkpoint type
             if checkpoint_type == "best_composite":
@@ -850,13 +868,16 @@ class EnhancedCLSTMPPOTrainer:
                 if model_path.exists():
                     latest_path.symlink_to(model_filename)
 
-            checkpoint_msg = f"💾 {checkpoint_type.title()} checkpoint saved at episode {self.episode}"
+            checkpoint_msg = f"✅ {checkpoint_type.title()} checkpoint saved at episode {self.episode}"
             if checkpoint_type != "regular":
                 checkpoint_msg += f" 🏆"
-            logger.info(checkpoint_msg)
+            if self.is_main_process:
+                logger.info(checkpoint_msg)
 
         except Exception as e:
             logger.error(f"❌ Failed to save checkpoint: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _load_checkpoint(self) -> bool:
         """Load training checkpoint"""
@@ -1663,6 +1684,12 @@ async def main():
     parser.add_argument('--quick-test', action='store_true',
                         help='Quick test mode: 3 symbols, 90 days data, 100 episodes')
 
+    # Transaction costs
+    parser.add_argument('--realistic-costs', dest='use_realistic_costs', action='store_true', default=True,
+                        help='Use realistic transaction costs (default: enabled)')
+    parser.add_argument('--no-realistic-costs', dest='use_realistic_costs', action='store_false',
+                        help='Disable realistic transaction costs for faster learning')
+
     args = parser.parse_args()
 
     # Quick test mode overrides
@@ -1701,10 +1728,10 @@ async def main():
         'entropy_coef': 0.2,  # INCREASED: Much higher exploration for trading (was 0.05, then 0.1)
         'include_technical_indicators': True,
         'include_market_microstructure': True,
-        # NEW: Enable realistic transaction costs
-        'use_realistic_costs': True,
-        'enable_slippage': True,
-        'slippage_model': 'volume_based',
+        # Transaction costs (configurable via --realistic-costs / --no-realistic-costs)
+        'use_realistic_costs': args.use_realistic_costs,
+        'enable_slippage': args.use_realistic_costs,  # Disable slippage if costs disabled
+        'slippage_model': 'volume_based' if args.use_realistic_costs else 'none',
         # Early stopping
         'early_stopping_patience': args.early_stopping_patience,
         'early_stopping_min_delta': args.early_stopping_min_delta
