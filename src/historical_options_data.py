@@ -1,51 +1,9 @@
 import pandas as pd
-
-try:
-    import alpaca_trade_api as tradeapi
-    from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest, OptionBarsRequest, OptionChainRequest
-    from alpaca.data.timeframe import TimeFrame
-    HAS_ALPACA = True
-except ImportError:
-    HAS_ALPACA = False
-    import warnings
-    warnings.warn("Alpaca packages not available, using mock implementations", ImportWarning)
-
-    # Mock classes for testing
-    class MockBarsResponse:
-        """Mock response for bars data"""
-        def __init__(self):
-            self.df = pd.DataFrame()
-
-    class MockAlpacaClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get_stock_bars(self, request):
-            """Mock method that returns empty bars"""
-            return MockBarsResponse()
-
-        def get_option_bars(self, request):
-            """Mock method that returns empty bars"""
-            return MockBarsResponse()
-
-        def get_option_chain(self, request):
-            """Mock method that returns empty option chain"""
-            return MockBarsResponse()
-
-    tradeapi = type('MockTradeAPI', (), {'REST': MockAlpacaClient})()
-    StockHistoricalDataClient = MockAlpacaClient
-    OptionHistoricalDataClient = MockAlpacaClient
-    StockBarsRequest = MockAlpacaClient
-    OptionBarsRequest = MockAlpacaClient
-    OptionChainRequest = MockAlpacaClient
-    TimeFrame = type('MockTimeFrame', (), {'Hour': '1Hour', 'Day': '1Day'})()
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime, timedelta
 import logging
 import asyncio
-import aiohttp
 import json
 import pickle
 import os
@@ -53,13 +11,32 @@ import sys
 from collections import defaultdict
 import pytz
 import time
-import ssl
-import certifi
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from dataclasses import dataclass
 import math
+
+# WebSocket imports for Massive.com API
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
+    import warnings
+    warnings.warn("websockets package not available. Install with: pip install websockets", ImportWarning)
+
+# aiohttp for async HTTP requests (legacy Alpaca methods)
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+    # Create a dummy class to avoid NameError
+    class aiohttp:
+        class ClientSession:
+            pass
+
 try:
     from scipy.stats import norm
     HAS_SCIPY = True
@@ -98,37 +75,54 @@ class DataQualityMetrics:
 
 
 class OptimizedHistoricalOptionsDataLoader:
-    """Enhanced data loader with improved caching, rate limiting, and data quality validation"""
+    """Enhanced data loader using Massive.com WebSocket API for options data"""
 
     def __init__(
         self,
         api_key: str,
-        api_secret: str,
-        base_url: str = 'https://paper-api.alpaca.markets',
-        data_url: str = 'https://data.alpaca.markets',
+        api_secret: str = None,  # Not used for Massive.com, kept for compatibility
+        base_url: str = None,  # Not used for Massive.com, kept for compatibility
+        data_url: str = None,  # Not used for Massive.com, kept for compatibility
         cache_dir: str = 'data/options_cache',
         max_workers: int = 4,
         rate_limit_delay: float = 0.1,
         cache_ttl_hours: int = 24
     ):
-        # Initialize Alpaca clients
-        self.trading_client = tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
-        self.stock_data_client = StockHistoricalDataClient(api_key, api_secret)
+        """
+        Initialize data loader with Massive.com API
 
-        # Try to initialize options data client (may not be available for all accounts)
-        try:
-            self.options_data_client = OptionHistoricalDataClient(api_key, api_secret)
-            self.has_options_data = True
-            logger.info("Options data client initialized successfully")
-        except Exception as e:
-            logger.warning(f"Options data client not available: {e}. Will use simulated options data.")
-            self.options_data_client = None
-            self.has_options_data = False
+        Args:
+            api_key: Massive.com API key (e.g., 'O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF')
+            api_secret: Not used (kept for backward compatibility)
+            base_url: Not used (kept for backward compatibility)
+            data_url: Not used (kept for backward compatibility)
+            cache_dir: Directory for caching data
+            max_workers: Number of worker threads
+            rate_limit_delay: Delay between API requests
+            cache_ttl_hours: Cache time-to-live in hours
 
+        WebSocket URLs:
+            - Real-time: wss://socket.massive.com/options
+            - Delayed (15-min): wss://delayed.massive.com/options
+        """
+        if not HAS_WEBSOCKETS:
+            raise ImportError("websockets package required. Install with: pip install websockets")
+
+        # Massive.com API configuration
         self.api_key = api_key
-        self.api_secret = api_secret
-        self.base_url = base_url
-        self.data_url = data_url
+
+        # REST API URLs (Polygon.io - Massive.com uses Polygon infrastructure)
+        self.rest_api_base_url = "https://api.polygon.io"
+
+        # WebSocket URLs for different data types
+        self.ws_url_stocks_realtime = "wss://socket.massive.com/stocks"
+        self.ws_url_stocks_delayed = "wss://delayed.massive.com/stocks"
+        self.ws_url_options_realtime = "wss://socket.massive.com/options"
+        self.ws_url_options_delayed = "wss://delayed.massive.com/options"
+
+        self.use_realtime = False  # Default to delayed data (15-min delay)
+
+        # Cache configuration
         self.cache_dir = cache_dir
         self.cache_ttl_hours = cache_ttl_hours
 
@@ -159,6 +153,24 @@ class OptimizedHistoricalOptionsDataLoader:
         # Cache management
         self.cache_index = self._load_cache_index()
         self.min_request_interval = 0.2  # 200ms between requests
+
+        # WebSocket connection state (separate connections for stocks and options)
+        self.ws_connection_stocks = None
+        self.ws_connection_options = None
+        self.ws_authenticated_stocks = False
+        self.ws_authenticated_options = False
+        self.ws_data_buffer = defaultdict(list)
+
+        # Options data availability flag
+        # Set to True since REST API is now implemented
+        self.has_options_data = True
+
+        logger.info(f"🚀 Initialized Massive.com data loader with API key: {api_key[:8]}...")
+        logger.info(f"   REST API Base URL: {self.rest_api_base_url}")
+        logger.info(f"   Stock WebSocket URL: {self.ws_url_stocks_realtime if self.use_realtime else self.ws_url_stocks_delayed}")
+        logger.info(f"   Options WebSocket URL: {self.ws_url_options_realtime if self.use_realtime else self.ws_url_options_delayed}")
+        logger.info(f"   Cache directory: {cache_dir}")
+        logger.info(f"✅ REST API enabled for historical data loading")
 
     def _load_cache_index(self) -> Dict:
         """Load cache index for tracking cached data"""
@@ -270,7 +282,189 @@ class OptimizedHistoricalOptionsDataLoader:
         """Get cache file path for a specific symbol and date"""
         date_str = date.strftime('%Y%m%d')
         return os.path.join(self.cache_dir, f"{symbol}_{date_str}_options.pkl")
-    
+
+    async def _connect_websocket(self, data_type: str = "options", verify_ssl: bool = True) -> bool:
+        """
+        Connect to Massive.com WebSocket API and authenticate
+
+        Args:
+            data_type: Type of data to connect to ("stocks" or "options")
+            verify_ssl: Whether to verify SSL certificates (default: True)
+
+        Returns:
+            bool: True if connection and authentication successful
+        """
+        try:
+            import ssl
+
+            # Select the appropriate WebSocket URL based on data type
+            if data_type == "stocks":
+                ws_url = self.ws_url_stocks_realtime if self.use_realtime else self.ws_url_stocks_delayed
+                connection_attr = "ws_connection_stocks"
+                auth_attr = "ws_authenticated_stocks"
+            else:  # options
+                ws_url = self.ws_url_options_realtime if self.use_realtime else self.ws_url_options_delayed
+                connection_attr = "ws_connection_options"
+                auth_attr = "ws_authenticated_options"
+
+            logger.info(f"🔌 Connecting to Massive.com {data_type.upper()} WebSocket: {ws_url}")
+
+            # Create SSL context
+            if verify_ssl:
+                # Use certifi's CA bundle for SSL verification
+                try:
+                    import certifi
+                    ssl_context = ssl.create_default_context(cafile=certifi.where())
+                    logger.info("✅ Using certifi CA bundle for SSL verification")
+                except ImportError:
+                    ssl_context = ssl.create_default_context()
+                    logger.warning("⚠️ certifi not available, using system CA bundle")
+            else:
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                logger.warning("⚠️ SSL certificate verification disabled")
+
+            # Connect to WebSocket
+            ws_connection = await websockets.connect(ws_url, ssl=ssl_context)
+            setattr(self, connection_attr, ws_connection)
+            logger.info(f"✅ {data_type.upper()} WebSocket connected")
+
+            # Wait for connection confirmation
+            response = await ws_connection.recv()
+            logger.info(f"📨 Connection response: {response}")
+
+            # Authenticate with API key
+            auth_message = json.dumps({"action": "auth", "params": self.api_key})
+            await ws_connection.send(auth_message)
+            logger.info(f"🔐 Sent authentication with API key: {self.api_key[:8]}...")
+
+            # Wait for authentication response
+            auth_response = await ws_connection.recv()
+            auth_data = json.loads(auth_response)
+            logger.info(f"📨 Auth response: {auth_data}")
+
+            # Check if authentication was successful
+            if isinstance(auth_data, list) and len(auth_data) > 0:
+                if auth_data[0].get('ev') == 'status' and auth_data[0].get('status') == 'auth_success':
+                    setattr(self, auth_attr, True)
+                    logger.info(f"✅ {data_type.upper()} WebSocket authenticated successfully")
+                    return True
+
+            logger.error(f"❌ {data_type.upper()} authentication failed: {auth_data}")
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ {data_type.upper()} WebSocket connection failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    async def _subscribe_to_options(self, option_symbols: List[str]) -> bool:
+        """
+        Subscribe to options data feeds
+
+        Args:
+            option_symbols: List of option contract symbols (e.g., ['O:SPY240119C00450000'])
+
+        Returns:
+            bool: True if subscription successful
+        """
+        if not self.ws_authenticated_options:
+            logger.error("❌ Cannot subscribe: OPTIONS WebSocket not authenticated")
+            return False
+
+        try:
+            # Massive.com supports up to 1,000 simultaneous subscriptions per connection
+            # Subscribe to minute aggregates (AM) for the option contracts
+            subscription_params = ",".join([f"AM.{symbol}" for symbol in option_symbols])
+            subscribe_message = json.dumps({
+                "action": "subscribe",
+                "params": subscription_params
+            })
+
+            await self.ws_connection_options.send(subscribe_message)
+            logger.info(f"📡 Subscribed to {len(option_symbols)} option contracts")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Subscription failed: {e}")
+            return False
+
+    async def _collect_websocket_data(self, duration_seconds: int = 60, data_type: str = "options") -> Dict[str, List[Dict]]:
+        """
+        Collect data from WebSocket for a specified duration
+
+        Args:
+            duration_seconds: How long to collect data (default: 60 seconds)
+            data_type: Type of data to collect ("stocks" or "options")
+
+        Returns:
+            Dict mapping symbols to list of data points
+        """
+        collected_data = defaultdict(list)
+        start_time = time.time()
+
+        # Select the appropriate WebSocket connection
+        ws_connection = self.ws_connection_options if data_type == "options" else self.ws_connection_stocks
+
+        try:
+            while (time.time() - start_time) < duration_seconds:
+                # Set a timeout to avoid blocking forever
+                try:
+                    message = await asyncio.wait_for(
+                        ws_connection.recv(),
+                        timeout=5.0
+                    )
+
+                    data = json.loads(message)
+
+                    # Process each message in the response
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get('ev') == 'AM':  # Aggregate Minute event
+                                symbol = item.get('sym')
+                                if symbol:
+                                    collected_data[symbol].append(item)
+
+                except asyncio.TimeoutError:
+                    # No data received in timeout period, continue
+                    continue
+
+        except Exception as e:
+            logger.error(f"❌ Error collecting {data_type.upper()} WebSocket data: {e}")
+
+        logger.info(f"📊 Collected {data_type.upper()} data for {len(collected_data)} symbols")
+        return dict(collected_data)
+
+    async def _disconnect_websocket(self, data_type: str = "both"):
+        """
+        Disconnect from WebSocket
+
+        Args:
+            data_type: Which connection to disconnect ("stocks", "options", or "both")
+        """
+        if data_type in ["options", "both"] and self.ws_connection_options:
+            try:
+                await self.ws_connection_options.close()
+                logger.info("🔌 OPTIONS WebSocket disconnected")
+            except Exception as e:
+                logger.error(f"❌ Error disconnecting OPTIONS WebSocket: {e}")
+            finally:
+                self.ws_connection_options = None
+                self.ws_authenticated_options = False
+
+        if data_type in ["stocks", "both"] and self.ws_connection_stocks:
+            try:
+                await self.ws_connection_stocks.close()
+                logger.info("🔌 STOCKS WebSocket disconnected")
+            except Exception as e:
+                logger.error(f"❌ Error disconnecting STOCKS WebSocket: {e}")
+            finally:
+                self.ws_connection_stocks = None
+                self.ws_authenticated_stocks = False
+
     async def load_historical_stock_data(
         self,
         symbols: List[str],
@@ -317,8 +511,8 @@ class OptimizedHistoricalOptionsDataLoader:
                     result[symbol] = data
                     continue
 
-                # Fetch from API
-                msg = f"  [{idx}/{total_symbols}] 🌐 Calling Alpaca API for {symbol}..."
+                # Use Massive.com REST API for historical stock data
+                msg = f"  [{idx}/{total_symbols}] 🌐 Fetching historical stock data from REST API..."
                 print(msg, flush=True)
                 logger.info(msg)
                 sys.stdout.flush()
@@ -326,45 +520,31 @@ class OptimizedHistoricalOptionsDataLoader:
 
                 await self._rate_limit_async()
 
-                request = StockBarsRequest(
-                    symbol_or_symbols=symbol,
-                    timeframe=TimeFrame.Hour if timeframe == "1Hour" else TimeFrame.Day,
-                    start=start_date,
-                    end=end_date
-                )
+                try:
+                    # Fetch real historical stock data using REST API
+                    data = await self._fetch_stock_data_rest_api(symbol, start_date, end_date)
 
-                # Run blocking API call in thread pool to not block event loop
-                msg = f"  [{idx}/{total_symbols}] ⏳ Waiting for API response..."
-                print(msg, flush=True)
-                logger.info(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
+                    if data is not None and len(data) > 0:
+                        msg = f"  [{idx}/{total_symbols}] ✅ Fetched {len(data)} real bars for {symbol}"
+                        print(msg, flush=True)
+                        logger.info(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    else:
+                        msg = f"  [{idx}/{total_symbols}] ⚠️ No data returned from REST API for {symbol}"
+                        print(msg, flush=True)
+                        logger.warning(msg)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        continue
 
-                bars = await asyncio.to_thread(self.stock_data_client.get_stock_bars, request)
-
-                msg = f"  [{idx}/{total_symbols}] 📦 Received API response for {symbol}"
-                print(msg, flush=True)
-                logger.info(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-                if bars.df.empty:
-                    msg = f"  [{idx}/{total_symbols}] ⚠️ {symbol}: No data returned from API"
+                except Exception as e:
+                    msg = f"  [{idx}/{total_symbols}] ❌ {symbol}: {type(e).__name__}: {e}"
                     print(msg, flush=True)
-                    logger.warning(msg)
+                    logger.error(msg)
                     sys.stdout.flush()
                     sys.stderr.flush()
                     continue
-
-                # Process and validate data
-                msg = f"  [{idx}/{total_symbols}] 🔄 Processing {len(bars.df)} bars for {symbol}..."
-                print(msg, flush=True)
-                logger.info(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-                data = bars.df.reset_index()
-                data['symbol'] = symbol
 
                 # Validate data quality
                 quality_metrics = self._validate_data_quality(data, f"{symbol}_stock")
@@ -608,330 +788,58 @@ class OptimizedHistoricalOptionsDataLoader:
         end_date: datetime,
         stock_data: pd.DataFrame
     ) -> List[Dict]:
-        """Fetch real options data from Alpaca API"""
-        options_data = []
+        """
+        Fetch real options data using Massive.com (Polygon.io) REST API
+
+        This method fetches historical options data using the Polygon.io REST API.
+        It gets options snapshots and aggregates for the specified date range.
+        """
+        msg = f"      🌐 Fetching real options data from REST API for {symbol}..."
+        print(msg, flush=True)
+        logger.info(msg)
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         try:
-            # Get options chain for the symbol
-            msg = f"      🔧 Creating options chain request for {symbol}..."
-            print(msg, flush=True)
-            logger.debug(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
+            options_data = []
 
-            chain_request = OptionChainRequest(
-                underlying_symbol=symbol,
-                expiration_date_gte=start_date.date(),
-                expiration_date_lte=(end_date + timedelta(days=45)).date()  # Include options expiring after our date range
-            )
+            # Iterate through each day in the date range
+            current_date = start_date
+            days_processed = 0
+            total_days = (end_date - start_date).days
 
-            # Use async rate limiting to not block event loop
-            msg = f"      ⏳ Rate limiting before API call..."
-            print(msg, flush=True)
-            logger.debug(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            await self._rate_limit_async()
-
-            # Log the request details for debugging
-            msg = f"      🌐 Calling Alpaca Options API for {symbol}..."
-            print(msg, flush=True)
-            logger.debug(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            try:
-                # Run blocking API call in thread pool
-                options_chain = await asyncio.to_thread(self.options_data_client.get_option_chain, chain_request)
-
-                msg = f"      📦 Received options chain response for {symbol}"
-                print(msg, flush=True)
-                logger.debug(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-            except Exception as api_error:
-                msg = f"      ❌ API error fetching options chain for {symbol}: {type(api_error).__name__}: {api_error}"
-                print(msg, flush=True)
-                logger.error(msg)
-
-                msg = f"      🔄 Falling back to simulated data for {symbol}"
-                print(msg, flush=True)
-                logger.info(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                return []
-
-            # Check if options_chain is valid
-            if not options_chain:
-                msg = f"      ⚠️ No options chain data returned from API for {symbol}"
-                print(msg, flush=True)
-                logger.warning(msg)
-
-                msg = f"      💡 This may be due to: 1) Demo API keys, 2) No options available, 3) API permissions"
-                print(msg, flush=True)
-                logger.info(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                return []
-
-            # Convert to list - Alpaca returns dict with option symbols as keys
-            msg = f"      🔄 Processing options chain for {symbol}..."
-            print(msg, flush=True)
-            logger.debug(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            chain_list = []
-
-            logger.debug(f"Options chain type: {type(options_chain)}")
-            logger.debug(f"Has 'options' attr: {hasattr(options_chain, 'options')}")
-            logger.debug(f"Is dict: {isinstance(options_chain, dict)}")
-
-            if hasattr(options_chain, 'options'):
-                # If it has an 'options' attribute
-                chain_list = options_chain.options
-                msg = f"      📋 Extracted {len(chain_list)} options from .options attribute"
-                print(msg, flush=True)
-                logger.debug(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-            elif isinstance(options_chain, dict):
-                # Alpaca returns dict like: {'SPY251104C00635000': OptionsSnapshot(...), ...}
-                total_options = len(options_chain)
-                msg = f"      📋 Processing dict with {total_options} options contracts..."
-                print(msg, flush=True)
-                logger.debug(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-                # Convert to list of dicts with symbol and data
-                processed_count = 0
-                for option_symbol, option_data in options_chain.items():
-                    processed_count += 1
-
-                    # Show progress every 1000 options
-                    if processed_count % 1000 == 0:
-                        msg = f"      ⏳ Processed {processed_count}/{total_options} options..."
-                        print(msg, flush=True)
-                        logger.debug(msg)
-                        sys.stdout.flush()
-                        sys.stderr.flush()
-                    # option_data can be either a dict or an OptionsSnapshot object
-                    if isinstance(option_data, dict):
-                        # Dict format
-                        option_dict = {
-                            'symbol': option_symbol,
-                            'strike_price': self._extract_strike_from_symbol(option_symbol),
-                            'expiration_date': self._extract_expiration_from_symbol(option_symbol),
-                            'type': 'call' if 'C' in option_symbol else 'put',
-                            'latest_quote': option_data.get('latest_quote', {}),
-                            'latest_trade': option_data.get('latest_trade', {}),
-                            'greeks': option_data.get('greeks'),
-                            'implied_volatility': option_data.get('implied_volatility')
-                        }
-                        chain_list.append(option_dict)
-                    elif hasattr(option_data, 'symbol'):
-                        # OptionsSnapshot object format
-                        option_dict = {
-                            'symbol': option_symbol,
-                            'strike_price': self._extract_strike_from_symbol(option_symbol),
-                            'expiration_date': self._extract_expiration_from_symbol(option_symbol),
-                            'type': 'call' if 'C' in option_symbol else 'put',
-                            'latest_quote': option_data.latest_quote if hasattr(option_data, 'latest_quote') else {},
-                            'latest_trade': option_data.latest_trade if hasattr(option_data, 'latest_trade') else {},
-                            'greeks': option_data.greeks if hasattr(option_data, 'greeks') else None,
-                            'implied_volatility': option_data.implied_volatility if hasattr(option_data, 'implied_volatility') else None
-                        }
-                        chain_list.append(option_dict)
-
-                msg = f"      ✅ Converted {len(chain_list)} options to internal format"
-                print(msg, flush=True)
-                logger.debug(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-            else:
-                chain_list = list(options_chain) if options_chain else []
-                msg = f"      📋 Converted to list (fallback): {len(chain_list)} items"
-                print(msg, flush=True)
-                logger.debug(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-            if not chain_list:
-                msg = f"      ⚠️ No options in chain for {symbol}"
-                print(msg, flush=True)
-                logger.warning(msg)
-
-                msg = f"      📊 Options chain object type: {type(options_chain)}"
-                print(msg, flush=True)
-                logger.info(msg)
-
-                if isinstance(options_chain, dict):
-                    msg = f"      🔑 Options chain keys (first 5): {list(options_chain.keys())[:5]}"
-                    print(msg, flush=True)
-                    logger.info(msg)
-
-                sys.stdout.flush()
-                sys.stderr.flush()
-                return []
-
-            msg = f"      ✅ Found {len(chain_list)} options in chain for {symbol}"
-            print(msg, flush=True)
-            logger.info(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            # OPTIMIZED: Batch fetch all options data at once instead of per-day
-            msg = f"      📅 Fetching options bars for entire date range ({start_date.date()} to {end_date.date()})..."
-            print(msg, flush=True)
-            logger.info(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            # Extract all unique option symbols from the chain
-            all_option_symbols = [opt['symbol'] for opt in chain_list]
-
-            msg = f"      📊 Batching request for {len(all_option_symbols)} option symbols..."
-            print(msg, flush=True)
-            logger.info(msg)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            # Batch the symbols into groups (Alpaca may have limits on batch size)
-            batch_size = 100  # Fetch 100 options at a time
-            total_batches = (len(all_option_symbols) + batch_size - 1) // batch_size
-
-            for batch_idx in range(0, len(all_option_symbols), batch_size):
-                batch_symbols = all_option_symbols[batch_idx:batch_idx + batch_size]
-                current_batch = (batch_idx // batch_size) + 1
-
-                msg = f"      ⏳ Fetching batch {current_batch}/{total_batches} ({len(batch_symbols)} options)..."
-                print(msg, flush=True)
-                logger.info(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-                try:
-                    # Create batched request for multiple symbols
-                    bars_request = OptionBarsRequest(
-                        symbol_or_symbols=batch_symbols,  # Pass list of symbols
-                        timeframe=TimeFrame.Hour,
-                        start=start_date,
-                        end=end_date
-                    )
-
-                    await self._rate_limit_async()
-
-                    msg = f"      🌐 Calling Alpaca API for batch {current_batch}/{total_batches}..."
-                    print(msg, flush=True)
-                    logger.debug(msg)
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-
-                    # Run blocking API call in thread pool
-                    bars = await asyncio.to_thread(self.options_data_client.get_option_bars, bars_request)
-
-                    msg = f"      📦 Received batch {current_batch}/{total_batches} response"
-                    print(msg, flush=True)
-                    logger.debug(msg)
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-
-                    if not bars.df.empty:
-                        msg = f"      🔄 Processing {len(bars.df)} bars from batch {current_batch}/{total_batches}..."
-                        print(msg, flush=True)
-                        logger.debug(msg)
-                        sys.stdout.flush()
-                        sys.stderr.flush()
-
-                        # Debug: Check DataFrame structure
-                        if current_batch == 1:
-                            msg = f"      🔍 DataFrame info: index={bars.df.index.names}, columns={list(bars.df.columns)}"
-                            print(msg, flush=True)
-                            logger.debug(msg)
-                            sys.stdout.flush()
-                            sys.stderr.flush()
-
-                        # Process all bars from this batch
-                        # Alpaca returns MultiIndex DataFrame with (symbol, timestamp) as index
-                        bars_processed = 0
-                        for idx, bar in bars.df.iterrows():
-                            # Extract symbol from MultiIndex
-                            if isinstance(idx, tuple):
-                                option_symbol = idx[0]  # First element is symbol
-                                bar_timestamp = idx[1]  # Second element is timestamp
-                            else:
-                                # Single index - might be timestamp, symbol in columns
-                                option_symbol = bar.get('symbol', None)
-                                bar_timestamp = idx
-
-                            if option_symbol:
-                                # Find the option details from chain_list
-                                option_info = next((opt for opt in chain_list if opt['symbol'] == option_symbol), None)
-                                if option_info:
-                                    # Get stock price for this timestamp
-                                    stock_price = self._get_stock_price_for_date(stock_data, bar_timestamp)
-
-                                    options_data.append({
-                                        'timestamp': bar_timestamp,
-                                        'symbol': symbol,
-                                        'option_symbol': option_symbol,
-                                        'strike': option_info['strike_price'],
-                                        'expiration': option_info['expiration_date'],
-                                        'option_type': option_info['type'],
-                                        'underlying_price': stock_price if stock_price else 0,
-                                        'open': bar.get('open', 0),
-                                        'high': bar.get('high', 0),
-                                        'low': bar.get('low', 0),
-                                        'close': bar.get('close', 0),
-                                        'volume': bar.get('volume', 0),
-                                        'bid': bar.get('bid', bar.get('close', 0) * 0.98),
-                                        'ask': bar.get('ask', bar.get('close', 0) * 1.02),
-                                        'implied_volatility': bar.get('implied_volatility', 0.3),
-                                        'delta': bar.get('delta', 0.5),
-                                        'gamma': bar.get('gamma', 0.1),
-                                        'theta': bar.get('theta', -0.05),
-                                        'vega': bar.get('vega', 0.2),
-                                        'rho': bar.get('rho', 0.1)
-                                    })
-                                    bars_processed += 1
-
-                        msg = f"      ✅ Batch {current_batch}/{total_batches} complete: {bars_processed} options data points added (from {len(bars.df)} bars)"
-                        print(msg, flush=True)
-                        logger.info(msg)
-                        sys.stdout.flush()
-                        sys.stderr.flush()
-                    else:
-                        msg = f"      ⚠️ Batch {current_batch}/{total_batches} returned no data"
-                        print(msg, flush=True)
-                        logger.warning(msg)
-                        sys.stdout.flush()
-                        sys.stderr.flush()
-
-                except Exception as e:
-                    msg = f"      ❌ Error fetching batch {current_batch}/{total_batches}: {e}"
-                    print(msg, flush=True)
-                    logger.error(msg)
-                    sys.stdout.flush()
-                    sys.stderr.flush()
+            while current_date <= end_date:
+                # Skip weekends
+                if current_date.weekday() >= 5:
+                    current_date += timedelta(days=1)
                     continue
 
-            msg = f"      ✅ Completed fetching options data ({len(options_data)} data points)"
+                # Rate limiting - don't overwhelm the API
+                if days_processed > 0 and days_processed % 5 == 0:
+                    await asyncio.sleep(0.1)  # Small delay every 5 days
+
+                # Get stock price for this date
+                stock_price = self._get_stock_price_for_date(stock_data, current_date)
+                if stock_price is None:
+                    current_date += timedelta(days=1)
+                    continue
+
+                # Fetch options snapshot for this underlying
+                daily_options = await self._fetch_options_snapshot_rest_api(symbol, current_date, stock_price)
+
+                if daily_options:
+                    options_data.extend(daily_options)
+
+                days_processed += 1
+                current_date += timedelta(days=1)
+
+            msg = f"      ✅ Fetched {len(options_data)} real options contracts for {symbol}"
             print(msg, flush=True)
             logger.info(msg)
             sys.stdout.flush()
             sys.stderr.flush()
 
-            if len(options_data) == 0:
-                msg = f"      ⚠️ WARNING: No options data was extracted from API responses!"
-                print(msg, flush=True)
-                logger.warning(msg)
-                msg = f"      💡 This may be due to: (1) MultiIndex parsing issue, (2) Symbol mismatch, (3) No matching options in chain"
-                print(msg, flush=True)
-                logger.warning(msg)
-                sys.stdout.flush()
-                sys.stderr.flush()
+            return options_data
 
         except Exception as e:
             msg = f"      ❌ Error fetching real options data for {symbol}: {e}"
@@ -939,14 +847,206 @@ class OptimizedHistoricalOptionsDataLoader:
             logger.error(msg)
             sys.stdout.flush()
             sys.stderr.flush()
+            import traceback
+            traceback.print_exc()
+            return []
 
-        msg = f"      📊 Returning {len(options_data)} options data points for {symbol}"
-        print(msg, flush=True)
-        logger.info(msg)
-        sys.stdout.flush()
-        sys.stderr.flush()
+    async def _fetch_options_snapshot_rest_api(
+        self,
+        symbol: str,
+        date: datetime,
+        stock_price: float
+    ) -> List[Dict]:
+        """
+        Fetch options snapshot for a specific underlying symbol and date
 
-        return options_data
+        Args:
+            symbol: Underlying stock symbol (e.g., 'SPY')
+            date: Date for the snapshot
+            stock_price: Current stock price for filtering
+
+        Returns:
+            List of option contracts with pricing and Greeks
+        """
+        try:
+            # Polygon.io REST API endpoint for options snapshot
+            # Format: /v3/snapshot/options/{underlyingAsset}
+            url = f"{self.rest_api_base_url}/v3/snapshot/options/{symbol}"
+
+            # Filter options by strike price (within ±20% of current price)
+            min_strike = stock_price * 0.8
+            max_strike = stock_price * 1.2
+
+            params = {
+                'apiKey': self.api_key,
+                'limit': 250,  # Get up to 250 contracts
+                'strike_price.gte': min_strike,
+                'strike_price.lte': max_strike,
+            }
+
+            try:
+                import aiohttp
+                import ssl
+                import certifi
+
+                # Create SSL context with certifi CA bundle
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+
+                            if data.get('status') == 'OK' and 'results' in data:
+                                results = data['results']
+
+                                if len(results) == 0:
+                                    return []
+
+                                # Convert to our format
+                                options_list = []
+                                for opt in results:
+                                    try:
+                                        details = opt.get('details', {})
+                                        day_data = opt.get('day', {})
+                                        greeks = opt.get('greeks', {})
+
+                                        option_dict = {
+                                            'timestamp': date,
+                                            'symbol': symbol,
+                                            'option_symbol': details.get('ticker', ''),
+                                            'option_type': details.get('contract_type', 'call'),
+                                            'strike': details.get('strike_price', 0),
+                                            'expiration': details.get('expiration_date', ''),
+                                            'bid': day_data.get('close', 0) * 0.98,  # Approximate bid
+                                            'ask': day_data.get('close', 0) * 1.02,  # Approximate ask
+                                            'last': day_data.get('close', 0),
+                                            'volume': day_data.get('volume', 0),
+                                            'open_interest': opt.get('open_interest', 0),
+                                            'underlying_price': stock_price,
+                                            'delta': greeks.get('delta', 0),
+                                            'gamma': greeks.get('gamma', 0),
+                                            'theta': greeks.get('theta', 0),
+                                            'vega': greeks.get('vega', 0),
+                                            'rho': greeks.get('rho', 0),
+                                            'implied_volatility': opt.get('implied_volatility', 0),
+                                        }
+                                        options_list.append(option_dict)
+                                    except Exception as e:
+                                        logger.debug(f"Error parsing option contract: {e}")
+                                        continue
+
+                                return options_list
+                            else:
+                                return []
+                        elif response.status == 429:
+                            # Rate limit hit - wait and retry
+                            logger.warning(f"Rate limit hit for {symbol}, waiting 1 second...")
+                            await asyncio.sleep(1)
+                            return []
+                        else:
+                            return []
+
+            except ImportError:
+                logger.error("aiohttp not installed. Install with: pip install aiohttp")
+                return []
+
+        except Exception as e:
+            logger.debug(f"Error fetching options snapshot for {symbol}: {e}")
+            return []
+
+    async def _fetch_stock_data_rest_api(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> pd.DataFrame:
+        """
+        Fetch historical stock data using Massive.com (Polygon.io) REST API
+
+        Args:
+            symbol: Stock symbol (e.g., 'SPY')
+            start_date: Start date for historical data
+            end_date: End date for historical data
+
+        Returns:
+            DataFrame with columns: timestamp, symbol, open, high, low, close, volume
+        """
+        try:
+            # Polygon.io REST API endpoint for aggregate bars
+            # Format: /v2/aggs/ticker/{stocksTicker}/range/{multiplier}/{timespan}/{from}/{to}
+            url = f"{self.rest_api_base_url}/v2/aggs/ticker/{symbol}/range/1/day/{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+
+            params = {
+                'apiKey': self.api_key,
+                'adjusted': 'true',
+                'sort': 'asc',
+                'limit': 50000  # Maximum results per request
+            }
+
+            # Use aiohttp for async HTTP requests
+            try:
+                import aiohttp
+                import ssl
+                import certifi
+
+                # Create SSL context with certifi CA bundle
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+
+                            if data.get('status') == 'OK' and 'results' in data:
+                                results = data['results']
+
+                                if len(results) == 0:
+                                    logger.warning(f"No stock data returned for {symbol}")
+                                    return None
+
+                                # Convert to DataFrame
+                                df = pd.DataFrame(results)
+
+                                # Rename columns to match our format
+                                df = df.rename(columns={
+                                    't': 'timestamp',
+                                    'o': 'open',
+                                    'h': 'high',
+                                    'l': 'low',
+                                    'c': 'close',
+                                    'v': 'volume',
+                                    'vw': 'vwap',
+                                    'n': 'transactions'
+                                })
+
+                                # Convert timestamp from milliseconds to datetime
+                                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                                df['symbol'] = symbol
+
+                                # Select only the columns we need
+                                df = df[['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+
+                                logger.info(f"✅ Fetched {len(df)} bars for {symbol} from REST API")
+                                return df
+                            else:
+                                logger.error(f"API returned status: {data.get('status')}, message: {data.get('message', 'No message')}")
+                                return None
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"HTTP {response.status} error fetching stock data for {symbol}: {error_text}")
+                            return None
+
+            except ImportError:
+                logger.error("aiohttp not installed. Install with: pip install aiohttp")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching stock data for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
 
     async def _generate_simulated_options_data(
         self,

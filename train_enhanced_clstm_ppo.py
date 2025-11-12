@@ -297,23 +297,23 @@ class EnhancedCLSTMPPOTrainer:
             logger.info("🔧 Initializing Enhanced CLSTM-PPO Trainer")
 
         # Create data loader (each process gets its own)
-        alpaca_api_key = os.getenv('ALPACA_API_KEY', 'demo_key')
-        alpaca_secret_key = os.getenv('ALPACA_SECRET_KEY', 'demo_secret')
+        # Use Massive.com API key for options data
+        massive_api_key = os.getenv('MASSIVE_API_KEY', 'O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF')
 
         # Log API key status (only on main process)
         if self.is_main_process:
-            if alpaca_api_key == 'demo_key' or alpaca_secret_key == 'demo_secret':
-                logger.warning("⚠️ Using demo Alpaca API keys - real options data will NOT be available")
-                logger.warning("   Set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables for real data")
-                logger.info("   Training will use simulated options data instead")
+            if massive_api_key == 'O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF':
+                logger.info(f"✅ Using Massive.com API key (key starts with: {massive_api_key[:8]}...)")
+                logger.warning("⚠️ WebSocket API provides real-time data only")
+                logger.warning("   Historical options data not yet implemented - using simulated data for training")
             else:
-                logger.info(f"✅ Using real Alpaca API keys (key starts with: {alpaca_api_key[:8]}...)")
+                logger.info(f"✅ Using custom Massive.com API key (key starts with: {massive_api_key[:8]}...)")
 
         self.data_loader = OptimizedHistoricalOptionsDataLoader(
-            api_key=alpaca_api_key,
-            api_secret=alpaca_secret_key,
-            base_url='https://paper-api.alpaca.markets',
-            data_url='https://data.alpaca.markets'
+            api_key=massive_api_key,
+            api_secret=None,  # Not used by Massive.com
+            base_url=None,    # Not used by Massive.com
+            data_url=None     # Not used by Massive.com
         )
 
         # Create enhanced working environment (with optional multi-leg support)
@@ -346,12 +346,15 @@ class EnhancedCLSTMPPOTrainer:
         # PAPER RECOMMENDATION: Use 2+ years of data for better LSTM feature extraction
         # For faster startup, use fewer days (configurable via --data-days argument)
         end_date = datetime.now() - timedelta(days=1)
-        data_days = self.config.get('data_days', 730)  # Default 2 years
+        data_days = self.config.get('data_days', 1095)  # Default 3 years (1095 days)
         start_date = end_date - timedelta(days=data_days)
 
         if self.is_main_process:
-            logger.info(f"📊 Loading {data_days} days of market data ({start_date.date()} to {end_date.date()})")
-            if data_days >= 365:
+            years = data_days / 365.0
+            logger.info(f"📊 Loading {data_days} days ({years:.1f} years) of market data ({start_date.date()} to {end_date.date()})")
+            if data_days >= 730:
+                logger.info(f"   ⏳ First load may take 15-45 minutes (data will be cached for future runs)")
+            elif data_days >= 365:
                 logger.info(f"   ⏳ First load may take 10-30 minutes (data will be cached for future runs)")
             else:
                 logger.info(f"   ⏳ First load may take 2-5 minutes (data will be cached for future runs)")
@@ -1679,8 +1682,8 @@ async def main():
                         help='Minimum improvement to reset patience (default: 0.001)')
 
     # Data loading options
-    parser.add_argument('--data-days', type=int, default=730,
-                        help='Number of days of historical data to load (default: 730 = 2 years)')
+    parser.add_argument('--data-days', type=int, default=1095,
+                        help='Number of days of historical data to load (default: 1095 = 3 years)')
     parser.add_argument('--quick-test', action='store_true',
                         help='Quick test mode: 3 symbols, 90 days data, 100 episodes')
 
