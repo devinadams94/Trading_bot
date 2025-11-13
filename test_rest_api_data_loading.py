@@ -5,21 +5,31 @@ Test script for Massive.com REST API data loading
 
 import asyncio
 import sys
+import os
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from src.historical_options_data import OptimizedHistoricalOptionsDataLoader
+
+# Load environment variables
+load_dotenv()
 
 async def test_rest_api_loading():
     """Test REST API data loading for stocks and options"""
-    
+
     print("=" * 80)
     print("🧪 Testing Massive.com REST API Data Loading")
     print("=" * 80)
     print()
-    
-    # Initialize data loader with Massive.com API key
-    api_key = "O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF"
-    
-    print(f"✅ Initializing data loader with API key: {api_key[:8]}...")
+
+    # Initialize data loader with Massive.com API key from .env
+    api_key = os.getenv('MASSIVE_API_KEY')
+
+    if not api_key:
+        print("❌ ERROR: MASSIVE_API_KEY not found in .env file")
+        print("   Please set MASSIVE_API_KEY in your .env file")
+        return
+
+    print(f"✅ Initializing data loader with API key from .env: {api_key[:8]}...")
     loader = OptimizedHistoricalOptionsDataLoader(
         api_key=api_key,
         api_secret=None,

@@ -513,8 +513,13 @@ class WorkingOptionsEnvironment(gym.Env):
         # Subtract transaction costs from reward (agent learns to minimize costs)
         net_return = raw_return - step_transaction_costs
 
-        # Apply paper's scaling factor (1e-4) for stable training
-        reward = net_return * 1e-4
+        # Apply scaling factor for stable training
+        # INCREASED from 1e-4 to 1e-3 for stronger learning signal
+        reward = net_return * 1e-3
+
+        # Penalize excessive trading to prevent overtrading
+        if trade_executed:
+            reward -= 0.02  # Small penalty for each trade
 
         # Update previous portfolio value for next step
         self.previous_portfolio_value = portfolio_value_after

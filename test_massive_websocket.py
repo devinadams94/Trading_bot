@@ -5,17 +5,27 @@ Test Massive.com WebSocket connection
 
 import asyncio
 import sys
+import os
+from dotenv import load_dotenv
 from src.historical_options_data import OptimizedHistoricalOptionsDataLoader
+
+# Load environment variables
+load_dotenv()
 
 async def test_websocket_connection():
     """Test connecting to Massive.com WebSocket API"""
-    
+
     print("🔌 Testing Massive.com WebSocket Connection")
     print("=" * 60)
-    
-    # Initialize loader with Massive.com API key (UPDATED)
+
+    # Initialize loader with Massive.com API key from .env
+    api_key = os.getenv('MASSIVE_API_KEY')
+    if not api_key:
+        print("❌ ERROR: MASSIVE_API_KEY not found in .env file")
+        return
+
     loader = OptimizedHistoricalOptionsDataLoader(
-        api_key='O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF'
+        api_key=api_key
     )
     
     print(f"✅ Loader initialized")
