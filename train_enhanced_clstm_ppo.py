@@ -297,24 +297,42 @@ class EnhancedCLSTMPPOTrainer:
             logger.info("🔧 Initializing Enhanced CLSTM-PPO Trainer")
 
         # Create data loader (each process gets its own)
-        # Use Massive.com API key for options data
-        massive_api_key = os.getenv('MASSIVE_API_KEY', 'O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF')
+        # Check if using flat files or REST API
+        use_flat_files = self.config.get('use_flat_files', False)
 
-        # Log API key status (only on main process)
-        if self.is_main_process:
-            if massive_api_key == 'O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF':
-                logger.info(f"✅ Using Massive.com API key (key starts with: {massive_api_key[:8]}...)")
-                logger.warning("⚠️ WebSocket API provides real-time data only")
-                logger.warning("   Historical options data not yet implemented - using simulated data for training")
-            else:
-                logger.info(f"✅ Using custom Massive.com API key (key starts with: {massive_api_key[:8]}...)")
+        if use_flat_files:
+            # Use flat file data loader (much faster, offline)
+            if self.is_main_process:
+                logger.info("📁 Using flat file data loader")
+                logger.info(f"   Data directory: {self.config.get('flat_files_dir', 'data/flat_files')}")
+                logger.info(f"   File format: {self.config.get('flat_files_format', 'parquet')}")
 
-        self.data_loader = OptimizedHistoricalOptionsDataLoader(
-            api_key=massive_api_key,
-            api_secret=None,  # Not used by Massive.com
-            base_url=None,    # Not used by Massive.com
-            data_url=None     # Not used by Massive.com
-        )
+            from src.flat_file_data_loader import FlatFileDataLoader
+            self.data_loader = FlatFileDataLoader(
+                data_dir=self.config.get('flat_files_dir', 'data/flat_files'),
+                file_format=self.config.get('flat_files_format', 'parquet'),
+                cache_in_memory=True
+            )
+        else:
+            # Use Massive.com REST API (slower, requires internet)
+            massive_api_key = os.getenv('MASSIVE_API_KEY')
+
+            # Log API key status (only on main process)
+            if self.is_main_process:
+                if massive_api_key:
+                    logger.info(f"✅ Using Massive.com API key from .env (key starts with: {massive_api_key[:8]}...)")
+                    logger.info("✅ REST API enabled for historical stock and options data")
+                else:
+                    logger.error("❌ No Massive.com API key found in environment!")
+                    logger.error("   Please set MASSIVE_API_KEY in your .env file")
+                    raise ValueError("MASSIVE_API_KEY not found in environment variables")
+
+            self.data_loader = OptimizedHistoricalOptionsDataLoader(
+                api_key=massive_api_key,
+                api_secret=None,  # Not used by Massive.com
+                base_url=None,    # Not used by Massive.com
+                data_url=None     # Not used by Massive.com
+            )
 
         # Create enhanced working environment (with optional multi-leg support)
         env_class = MultiLegOptionsEnvironment if self.enable_multi_leg else WorkingOptionsEnvironment
@@ -520,6 +538,32 @@ class EnhancedCLSTMPPOTrainer:
                 logger.info(f"   Best Sharpe ratio: {self.best_sharpe_ratio:.2f}")
                 logger.info(f"   Training metrics loaded: {len(self.episode_returns)} episodes")
                 logger.info(f"   🏆 Resuming from best composite model (optimizes WR+PR+Return together)")
+
+                # CRITICAL: Update hyperparameters from config (override checkpoint values)
+                # This allows us to change hyperparameters mid-training
+                if HAS_CLSTM_PPO and hasattr(self.agent, 'entropy_coef'):
+                    old_entropy = self.agent.entropy_coef
+                    new_entropy = self.config.get('entropy_coef', 0.05)
+                    if old_entropy != new_entropy:
+                        self.agent.entropy_coef = new_entropy
+                        logger.info(f"   🔧 Updated entropy coefficient: {old_entropy:.3f} → {new_entropy:.3f}")
+
+                    # Update learning rates
+                    new_lr_ac = self.config.get('learning_rate_actor_critic', 3e-4)
+                    new_lr_clstm = self.config.get('learning_rate_clstm', 1e-3)
+
+                    # Update optimizer learning rates
+                    for param_group in self.agent.ppo_optimizer.param_groups:
+                        old_lr = param_group['lr']
+                        if old_lr != new_lr_ac:
+                            param_group['lr'] = new_lr_ac
+                            logger.info(f"   🔧 Updated PPO learning rate: {old_lr:.6f} → {new_lr_ac:.6f}")
+
+                    for param_group in self.agent.clstm_optimizer.param_groups:
+                        old_lr = param_group['lr']
+                        if old_lr != new_lr_clstm:
+                            param_group['lr'] = new_lr_clstm
+                            logger.info(f"   🔧 Updated CLSTM learning rate: {old_lr:.6f} → {new_lr_clstm:.6f}")
 
                 import sys
                 sys.stdout.flush()
@@ -1693,6 +1737,14 @@ async def main():
     parser.add_argument('--no-realistic-costs', dest='use_realistic_costs', action='store_false',
                         help='Disable realistic transaction costs for faster learning')
 
+    # Data source options
+    parser.add_argument('--use-flat-files', action='store_true', default=False,
+                        help='Use flat files instead of REST API (much faster)')
+    parser.add_argument('--flat-files-dir', type=str, default='data/flat_files',
+                        help='Directory containing flat files (default: data/flat_files)')
+    parser.add_argument('--flat-files-format', type=str, choices=['parquet', 'csv'], default='parquet',
+                        help='Flat file format (default: parquet)')
+
     args = parser.parse_args()
 
     # Quick test mode overrides
@@ -1726,9 +1778,9 @@ async def main():
         'use_clstm_pretraining': args.pretraining,
         'symbols': symbols_list,
         'data_days': args.data_days,  # Pass data_days to config
-        'learning_rate_actor_critic': 1e-3,
-        'learning_rate_clstm': 3e-3,
-        'entropy_coef': 0.2,  # INCREASED: Much higher exploration for trading (was 0.05, then 0.1)
+        'learning_rate_actor_critic': 3e-4,  # REDUCED: More stable learning (was 1e-3)
+        'learning_rate_clstm': 1e-3,  # REDUCED: More stable learning (was 3e-3)
+        'entropy_coef': 0.05,  # REDUCED: Prevent overtrading (was 0.2)
         'include_technical_indicators': True,
         'include_market_microstructure': True,
         # Transaction costs (configurable via --realistic-costs / --no-realistic-costs)
@@ -1737,7 +1789,11 @@ async def main():
         'slippage_model': 'volume_based' if args.use_realistic_costs else 'none',
         # Early stopping
         'early_stopping_patience': args.early_stopping_patience,
-        'early_stopping_min_delta': args.early_stopping_min_delta
+        'early_stopping_min_delta': args.early_stopping_min_delta,
+        # Data source (flat files vs REST API)
+        'use_flat_files': args.use_flat_files,
+        'flat_files_dir': args.flat_files_dir,
+        'flat_files_format': args.flat_files_format
     }
 
     logger.info("🚀 Starting Enhanced CLSTM-PPO Training with Multi-GPU Support")

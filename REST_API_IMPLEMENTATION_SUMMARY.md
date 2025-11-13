@@ -206,7 +206,7 @@ cache/
 
 ## 🔑 API Key Information
 
-**Current API Key:** `O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF`
+**API Key Location:** Stored in `.env` file as `MASSIVE_API_KEY`
 
 **Confirmed Access:**
 - ✅ Stock REST API (aggregate bars)
@@ -223,6 +223,12 @@ cache/
 - Rate limiting: 0.1s delay every 5 days
 - Timeout: 30 seconds per request
 - Retry logic: Not yet implemented (TODO)
+
+**Setup:**
+Add to your `.env` file:
+```
+MASSIVE_API_KEY=your_api_key_here
+```
 
 ---
 

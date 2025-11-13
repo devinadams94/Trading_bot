@@ -92,7 +92,7 @@ class OptimizedHistoricalOptionsDataLoader:
         Initialize data loader with Massive.com API
 
         Args:
-            api_key: Massive.com API key (e.g., 'O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF')
+            api_key: Massive.com API key (loaded from MASSIVE_API_KEY env variable)
             api_secret: Not used (kept for backward compatibility)
             base_url: Not used (kept for backward compatibility)
             data_url: Not used (kept for backward compatibility)

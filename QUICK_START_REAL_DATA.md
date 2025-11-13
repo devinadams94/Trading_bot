@@ -224,7 +224,13 @@ Episode 1/1000:
 
 ## 📝 API Key Information
 
-**Current API Key:** `O_182Z1cNv_y6zMpPwjLZ_pwIH8W9lWF`
+**API Key Location:** Stored in `.env` file as `MASSIVE_API_KEY`
+
+**Setup:**
+Add to your `.env` file:
+```
+MASSIVE_API_KEY=your_api_key_here
+```
 
 **Confirmed Access:**
 - ✅ Stock REST API (aggregate bars)
