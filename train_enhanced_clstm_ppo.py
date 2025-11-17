@@ -417,21 +417,32 @@ class EnhancedCLSTMPPOTrainer:
                             logger.warning(f"⚠️  {symbol}: Only {len(options)} options contracts (may be insufficient)")
 
                 # Overall validation
-                if avg_days < data_days * 0.5:
-                    logger.error(f"❌ INSUFFICIENT DATA: Average {avg_days:.0f} days per symbol (requested {data_days})")
-                    logger.error(f"   Your flat files contain less than 50% of requested data!")
+                # Note: Calendar days vs Trading days
+                # - 730 calendar days = ~2 years
+                # - Markets closed weekends (104 days/year) + holidays (~9 days/year)
+                # - Expected trading days: ~252 per year, ~504 for 2 years
+                # - So 499 trading days out of 730 calendar days = 68% is NORMAL and CORRECT
+
+                # Calculate expected trading days (assume ~252 trading days per year)
+                expected_trading_days = (data_days / 365.25) * 252
+                coverage_pct = (avg_days / expected_trading_days) * 100 if expected_trading_days > 0 else 0
+
+                if avg_days < expected_trading_days * 0.5:
+                    logger.error(f"❌ INSUFFICIENT DATA: Average {avg_days:.0f} trading days per symbol")
+                    logger.error(f"   Requested: {data_days} calendar days (~{expected_trading_days:.0f} trading days expected)")
+                    logger.error(f"   Coverage: {coverage_pct:.0f}% (need at least 50%)")
                     logger.error(f"   Please download more data:")
                     logger.error(f"   python3 download_data_to_flat_files.py --days {data_days}")
 
                     # Only raise error if not in quick test mode
                     if not self.config.get('quick_test', False):
-                        raise ValueError(f"Insufficient data for training: {avg_days:.0f} days available, {data_days} requested")
-                elif avg_days < data_days * 0.8:
-                    logger.warning(f"⚠️  Data coverage is {avg_days:.0f}/{data_days} days ({avg_days/data_days*100:.0f}%)")
+                        raise ValueError(f"Insufficient data for training: {avg_days:.0f} trading days available, ~{expected_trading_days:.0f} expected")
+                elif avg_days < expected_trading_days * 0.9:
+                    logger.warning(f"⚠️  Data coverage: {avg_days:.0f} trading days ({coverage_pct:.0f}% of expected ~{expected_trading_days:.0f})")
                     logger.warning(f"   Consider downloading more data for better training:")
                     logger.warning(f"   python3 download_data_to_flat_files.py --days {data_days}")
                 else:
-                    logger.info(f"✅ Data coverage is sufficient: {avg_days:.0f}/{data_days} days ({avg_days/data_days*100:.0f}%)")
+                    logger.info(f"✅ Data coverage is excellent: {avg_days:.0f} trading days ({coverage_pct:.0f}% of expected ~{expected_trading_days:.0f})")
 
         if self.is_main_process:
             msg = f"✅ Environment initialized with {len(self.env.symbols)} symbols"
@@ -1880,20 +1891,24 @@ async def main():
                     sample_df = pd.read_csv(sample_file)
 
                 actual_days = len(sample_df)
-                coverage_pct = (actual_days / args.data_days) * 100
 
-                if actual_days < args.data_days * 0.5:
-                    logger.error(f"❌ INSUFFICIENT DATA: Flat files contain {actual_days} days, but {args.data_days} requested")
-                    logger.error(f"   Data coverage: {coverage_pct:.0f}% (need at least 50%)")
+                # Calculate expected trading days (assume ~252 trading days per year)
+                expected_trading_days = (args.data_days / 365.25) * 252
+                coverage_pct = (actual_days / expected_trading_days) * 100
+
+                if actual_days < expected_trading_days * 0.5:
+                    logger.error(f"❌ INSUFFICIENT DATA: Flat files contain {actual_days} trading days")
+                    logger.error(f"   Requested: {args.data_days} calendar days (~{expected_trading_days:.0f} trading days expected)")
+                    logger.error(f"   Coverage: {coverage_pct:.0f}% (need at least 50%)")
                     logger.error(f"   Please download more data:")
                     logger.error(f"   python3 download_data_to_flat_files.py --days {args.data_days}")
-                    raise ValueError(f"Insufficient data in flat files: {actual_days} days available, {args.data_days} requested")
-                elif actual_days < args.data_days * 0.8:
-                    logger.warning(f"⚠️  Data coverage: {actual_days}/{args.data_days} days ({coverage_pct:.0f}%)")
+                    raise ValueError(f"Insufficient data in flat files: {actual_days} trading days available, ~{expected_trading_days:.0f} expected")
+                elif actual_days < expected_trading_days * 0.9:
+                    logger.warning(f"⚠️  Data coverage: {actual_days} trading days ({coverage_pct:.0f}% of expected ~{expected_trading_days:.0f})")
                     logger.warning(f"   Consider downloading more data:")
                     logger.warning(f"   python3 download_data_to_flat_files.py --days {args.data_days}")
                 else:
-                    logger.info(f"✅ Data coverage is sufficient: {actual_days}/{args.data_days} days ({coverage_pct:.0f}%)")
+                    logger.info(f"✅ Data coverage is excellent: {actual_days} trading days ({coverage_pct:.0f}% of expected ~{expected_trading_days:.0f})")
         else:
             logger.warning(f"⚠️  No flat file data found in {args.flat_files_dir}")
             logger.warning(f"   Please run: python3 download_data_to_flat_files.py --days {args.data_days}")
