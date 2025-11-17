@@ -38,6 +38,9 @@ except ImportError:
         def calculate_adx(high, low, close, period=14):
             return 25.0
 
+# Setup logger first
+logger = logging.getLogger(__name__)
+
 # Import realistic transaction costs
 try:
     from .realistic_transaction_costs import RealisticTransactionCostCalculator
@@ -45,8 +48,6 @@ except ImportError:
     # Fallback if import fails
     RealisticTransactionCostCalculator = None
     logger.warning("⚠️ Realistic transaction costs not available, using legacy commission model")
-
-logger = logging.getLogger(__name__)
 
 
 class WorkingOptionsEnvironment(gym.Env):
@@ -158,28 +159,85 @@ class WorkingOptionsEnvironment(gym.Env):
         logger.info(f"  Max positions: {max_positions}")
     
     async def load_data(self, start_date: datetime, end_date: datetime):
-        """Load market data"""
+        """Load market data and options data with Greeks"""
         logger.info(f"Loading data from {start_date.date()} to {end_date.date()}")
-        
+
         # Create simple synthetic data if no data loader
         if self.data_loader is None:
             self._create_synthetic_data(start_date, end_date)
+            self.options_data = {}  # No options data for synthetic
         else:
             try:
-                # Try to load real data
-                self.market_data = await self.data_loader.load_historical_data(
+                # Try to load real stock data
+                self.market_data = await self.data_loader.load_historical_stock_data(
                     self.symbols, start_date, end_date
                 )
+
+                # Try to load real options data with Greeks
+                logger.info("📊 Loading options data with Greeks...")
+                try:
+                    self.options_data = await self.data_loader.load_historical_options_data(
+                        self.symbols, start_date, end_date
+                    )
+
+                    # Log Greeks availability
+                    total_contracts = sum(len(opts) for opts in self.options_data.values())
+                    logger.info(f"✅ Loaded {total_contracts} options contracts with Greeks")
+
+                    # Check if Greeks are present
+                    if total_contracts > 0:
+                        sample_symbol = list(self.options_data.keys())[0]
+                        sample_contract = self.options_data[sample_symbol][0]
+                        has_greeks = any(k in sample_contract for k in ['delta', 'gamma', 'theta', 'vega'])
+                        if has_greeks:
+                            logger.info("✅ Greeks (delta, gamma, theta, vega) available in options data")
+                        else:
+                            logger.warning("⚠️  Greeks not found in options data")
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to load options data: {e}")
+                    self.options_data = {}
+
                 if not self.market_data:
                     logger.warning("No real data loaded, using synthetic data")
                     self._create_synthetic_data(start_date, end_date)
+                    self.options_data = {}
             except Exception as e:
                 logger.warning(f"Failed to load real data: {e}, using synthetic data")
                 self._create_synthetic_data(start_date, end_date)
-        
+                self.options_data = {}
+
         self.data_loaded = True
         logger.info(f"Data loaded for {len(self.market_data)} symbols")
     
+    def _find_option_contract(self, symbol: str, strike: float, option_type: str, tolerance: float = 0.5) -> Optional[Dict]:
+        """
+        Find matching option contract from loaded options data
+
+        Args:
+            symbol: Underlying symbol
+            strike: Strike price
+            option_type: 'call' or 'put'
+            tolerance: Strike price tolerance (default: $0.50)
+
+        Returns:
+            Option contract dict with Greeks, or None if not found
+        """
+        if not hasattr(self, 'options_data') or symbol not in self.options_data:
+            return None
+
+        # Find options with matching strike and type
+        matching_options = [
+            opt for opt in self.options_data[symbol]
+            if abs(opt.get('strike', 0) - strike) <= tolerance
+            and opt.get('option_type', '').lower() == option_type.lower()
+        ]
+
+        if not matching_options:
+            return None
+
+        # Return the closest match by strike
+        return min(matching_options, key=lambda x: abs(x.get('strike', 0) - strike))
+
     def _create_synthetic_data(self, start_date: datetime, end_date: datetime):
         """Create synthetic market data"""
         days = (end_date - start_date).days
@@ -317,6 +375,24 @@ class WorkingOptionsEnvironment(gym.Env):
                 step_transaction_costs += transaction_cost
                 transaction_cost_breakdown = cost_breakdown
 
+                # Try to find real option contract with Greeks
+                option_contract = self._find_option_contract(
+                    self.current_symbol, strike_price, 'call'
+                )
+
+                # Extract Greeks from real contract or use defaults
+                if option_contract:
+                    delta = option_contract.get('delta', 0.0)
+                    gamma = option_contract.get('gamma', 0.0)
+                    theta = option_contract.get('theta', 0.0)
+                    vega = option_contract.get('vega', 0.0)
+                else:
+                    # Default Greeks for calls (approximate)
+                    delta = 0.5  # ATM call delta
+                    gamma = 0.05
+                    theta = -0.5
+                    vega = 0.02
+
                 position = {
                     'type': 'call',
                     'strike': strike_price,
@@ -325,13 +401,18 @@ class WorkingOptionsEnvironment(gym.Env):
                     'symbol': self.current_symbol,
                     'entry_step': self.current_step,
                     'cost': total_cost,
-                    'transaction_cost': transaction_cost
+                    'transaction_cost': transaction_cost,
+                    # Store Greeks
+                    'delta': delta,
+                    'gamma': gamma,
+                    'theta': theta,
+                    'vega': vega
                 }
                 self.positions.append(position)
 
                 action_name = f"BUY_CALL_{strike_price:.0f}"
 
-                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}")
+                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}, delta={delta:.3f}")
 
         elif 11 <= action <= 20:
             # Buy put options
@@ -379,6 +460,24 @@ class WorkingOptionsEnvironment(gym.Env):
                 step_transaction_costs += transaction_cost
                 transaction_cost_breakdown = cost_breakdown
 
+                # Try to find real option contract with Greeks
+                option_contract = self._find_option_contract(
+                    self.current_symbol, strike_price, 'put'
+                )
+
+                # Extract Greeks from real contract or use defaults
+                if option_contract:
+                    delta = option_contract.get('delta', 0.0)
+                    gamma = option_contract.get('gamma', 0.0)
+                    theta = option_contract.get('theta', 0.0)
+                    vega = option_contract.get('vega', 0.0)
+                else:
+                    # Default Greeks for puts (approximate)
+                    delta = -0.5  # ATM put delta (negative)
+                    gamma = 0.05
+                    theta = -0.5
+                    vega = 0.02
+
                 position = {
                     'type': 'put',
                     'strike': strike_price,
@@ -387,13 +486,18 @@ class WorkingOptionsEnvironment(gym.Env):
                     'symbol': self.current_symbol,
                     'entry_step': self.current_step,
                     'cost': total_cost,
-                    'transaction_cost': transaction_cost
+                    'transaction_cost': transaction_cost,
+                    # Store Greeks
+                    'delta': delta,
+                    'gamma': gamma,
+                    'theta': theta,
+                    'vega': vega
                 }
                 self.positions.append(position)
 
                 action_name = f"BUY_PUT_{strike_price:.0f}"
 
-                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}")
+                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}, delta={delta:.3f}")
             
         elif 21 <= action <= 30:
             # Sell positions (or buy if no positions)
@@ -733,8 +837,21 @@ class WorkingOptionsEnvironment(gym.Env):
             self.current_step / self.episode_length  # Episode progress
         ], dtype=np.float32)
 
-        # Greeks summary (simplified - zeros for now)
+        # Greeks summary - extract from current positions
         greeks_summary = np.zeros(self.max_positions * 4, dtype=np.float32)
+
+        for i, position in enumerate(self.positions[:self.max_positions]):
+            # Extract Greeks from position (stored when position was opened)
+            delta = position.get('delta', 0.0)
+            gamma = position.get('gamma', 0.0)
+            theta = position.get('theta', 0.0)
+            vega = position.get('vega', 0.0)
+
+            # Populate greeks_summary: [delta, gamma, theta, vega] for each position
+            greeks_summary[i*4 + 0] = delta
+            greeks_summary[i*4 + 1] = gamma
+            greeks_summary[i*4 + 2] = theta
+            greeks_summary[i*4 + 3] = vega
 
         # Symbol encoding (one-hot for current primary symbol)
         symbol_encoding = np.zeros(num_symbols, dtype=np.float32)
