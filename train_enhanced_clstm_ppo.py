@@ -364,7 +364,7 @@ class EnhancedCLSTMPPOTrainer:
         # PAPER RECOMMENDATION: Use 2+ years of data for better LSTM feature extraction
         # For faster startup, use fewer days (configurable via --data-days argument)
         end_date = datetime.now() - timedelta(days=1)
-        data_days = self.config.get('data_days', 1095)  # Default 3 years (1095 days)
+        data_days = self.config.get('data_days', 730)  # Default 2 years (730 days)
         start_date = end_date - timedelta(days=data_days)
 
         if self.is_main_process:
@@ -383,6 +383,55 @@ class EnhancedCLSTMPPOTrainer:
             sys.stderr.flush()
 
         await self.env.load_data(start_date, end_date)
+
+        # VALIDATION: Check if we got enough data
+        if self.is_main_process:
+            if hasattr(self.env, 'market_data') and self.env.market_data:
+                logger.info("🔍 Validating data coverage...")
+
+                # Check stock data
+                total_stock_days = 0
+                min_days = float('inf')
+                max_days = 0
+
+                for symbol, df in self.env.market_data.items():
+                    actual_days = len(df)
+                    total_stock_days += actual_days
+                    min_days = min(min_days, actual_days)
+                    max_days = max(max_days, actual_days)
+
+                    if actual_days < data_days * 0.5:  # Less than 50% of requested
+                        logger.warning(f"⚠️  {symbol}: Only {actual_days} days of stock data (requested {data_days})")
+
+                avg_days = total_stock_days / len(self.env.market_data) if self.env.market_data else 0
+
+                logger.info(f"📊 Stock data coverage: {min_days}-{max_days} days (avg: {avg_days:.0f} days)")
+
+                # Check options data
+                if hasattr(self.env, 'options_data') and self.env.options_data:
+                    total_contracts = sum(len(options) for options in self.env.options_data.values())
+                    logger.info(f"📊 Options data: {total_contracts:,} total contracts across {len(self.env.options_data)} symbols")
+
+                    for symbol, options in self.env.options_data.items():
+                        if len(options) < 1000:  # Arbitrary threshold
+                            logger.warning(f"⚠️  {symbol}: Only {len(options)} options contracts (may be insufficient)")
+
+                # Overall validation
+                if avg_days < data_days * 0.5:
+                    logger.error(f"❌ INSUFFICIENT DATA: Average {avg_days:.0f} days per symbol (requested {data_days})")
+                    logger.error(f"   Your flat files contain less than 50% of requested data!")
+                    logger.error(f"   Please download more data:")
+                    logger.error(f"   python3 download_data_to_flat_files.py --days {data_days}")
+
+                    # Only raise error if not in quick test mode
+                    if not self.config.get('quick_test', False):
+                        raise ValueError(f"Insufficient data for training: {avg_days:.0f} days available, {data_days} requested")
+                elif avg_days < data_days * 0.8:
+                    logger.warning(f"⚠️  Data coverage is {avg_days:.0f}/{data_days} days ({avg_days/data_days*100:.0f}%)")
+                    logger.warning(f"   Consider downloading more data for better training:")
+                    logger.warning(f"   python3 download_data_to_flat_files.py --days {data_days}")
+                else:
+                    logger.info(f"✅ Data coverage is sufficient: {avg_days:.0f}/{data_days} days ({avg_days/data_days*100:.0f}%)")
 
         if self.is_main_process:
             msg = f"✅ Environment initialized with {len(self.env.symbols)} symbols"
@@ -1726,8 +1775,8 @@ async def main():
                         help='Minimum improvement to reset patience (default: 0.001)')
 
     # Data loading options
-    parser.add_argument('--data-days', type=int, default=1095,
-                        help='Number of days of historical data to load (default: 1095 = 3 years)')
+    parser.add_argument('--data-days', type=int, default=730,
+                        help='Number of days of historical data to load (default: 730 = 2 years)')
     parser.add_argument('--quick-test', action='store_true',
                         help='Quick test mode: 3 symbols, 90 days data, 100 episodes')
 
@@ -1773,11 +1822,91 @@ async def main():
             'JPM', 'BAC', 'GS', 'V', 'MA'  # Financials
         ]
 
+    # If using flat files, filter to only symbols that have data available
+    if args.use_flat_files:
+        import os
+        import pandas as pd
+
+        available_symbols = []
+        stocks_dir = os.path.join(args.flat_files_dir, 'stocks')
+        options_dir = os.path.join(args.flat_files_dir, 'options')
+
+        logger.info("🔍 Pre-training validation: Checking flat file data coverage...")
+
+        for symbol in symbols_list:
+            # Check if both stock and options data exist
+            stock_file = os.path.join(stocks_dir, f"{symbol}.{args.flat_files_format}")
+            options_file = os.path.join(options_dir, f"{symbol}_options.{args.flat_files_format}")
+
+            if os.path.exists(stock_file) and os.path.exists(options_file):
+                # Validate data coverage
+                try:
+                    if args.flat_files_format == 'parquet':
+                        stock_df = pd.read_parquet(stock_file)
+                        options_df = pd.read_parquet(options_file)
+                    else:
+                        stock_df = pd.read_csv(stock_file)
+                        options_df = pd.read_csv(options_file)
+
+                    stock_days = len(stock_df)
+                    options_contracts = len(options_df)
+
+                    # Check if data is sufficient
+                    if stock_days < args.data_days * 0.3:  # Less than 30% of requested
+                        logger.warning(f"⚠️  {symbol}: Only {stock_days} days in flat file (requested {args.data_days})")
+
+                    if options_contracts < 500:  # Arbitrary minimum
+                        logger.warning(f"⚠️  {symbol}: Only {options_contracts} options contracts (may be insufficient)")
+
+                    available_symbols.append(symbol)
+                    logger.info(f"  ✅ {symbol}: {stock_days} days stock, {options_contracts:,} options")
+
+                except Exception as e:
+                    logger.error(f"  ❌ {symbol}: Error reading flat file: {e}")
+
+        if available_symbols:
+            logger.info(f"📊 Using flat files: Found data for {len(available_symbols)} symbols: {available_symbols}")
+            symbols_list = available_symbols
+
+            # Final validation: Check if we should proceed
+            if not args.quick_test:
+                # Load one symbol to check date range
+                sample_symbol = available_symbols[0]
+                sample_file = os.path.join(stocks_dir, f"{sample_symbol}.{args.flat_files_format}")
+
+                if args.flat_files_format == 'parquet':
+                    sample_df = pd.read_parquet(sample_file)
+                else:
+                    sample_df = pd.read_csv(sample_file)
+
+                actual_days = len(sample_df)
+                coverage_pct = (actual_days / args.data_days) * 100
+
+                if actual_days < args.data_days * 0.5:
+                    logger.error(f"❌ INSUFFICIENT DATA: Flat files contain {actual_days} days, but {args.data_days} requested")
+                    logger.error(f"   Data coverage: {coverage_pct:.0f}% (need at least 50%)")
+                    logger.error(f"   Please download more data:")
+                    logger.error(f"   python3 download_data_to_flat_files.py --days {args.data_days}")
+                    raise ValueError(f"Insufficient data in flat files: {actual_days} days available, {args.data_days} requested")
+                elif actual_days < args.data_days * 0.8:
+                    logger.warning(f"⚠️  Data coverage: {actual_days}/{args.data_days} days ({coverage_pct:.0f}%)")
+                    logger.warning(f"   Consider downloading more data:")
+                    logger.warning(f"   python3 download_data_to_flat_files.py --days {args.data_days}")
+                else:
+                    logger.info(f"✅ Data coverage is sufficient: {actual_days}/{args.data_days} days ({coverage_pct:.0f}%)")
+        else:
+            logger.warning(f"⚠️  No flat file data found in {args.flat_files_dir}")
+            logger.warning(f"   Please run: python3 download_data_to_flat_files.py --days {args.data_days}")
+            logger.warning(f"   Falling back to REST API or synthetic data")
+    else:
+        logger.info(f"📊 Using REST API for {len(symbols_list)} symbols")
+
     config = {
         'num_episodes': args.episodes,
         'use_clstm_pretraining': args.pretraining,
         'symbols': symbols_list,
         'data_days': args.data_days,  # Pass data_days to config
+        'quick_test': args.quick_test,  # Pass quick_test flag for validation
         'learning_rate_actor_critic': 3e-4,  # REDUCED: More stable learning (was 1e-3)
         'learning_rate_clstm': 1e-3,  # REDUCED: More stable learning (was 3e-3)
         'entropy_coef': 0.05,  # REDUCED: Prevent overtrading (was 0.2)

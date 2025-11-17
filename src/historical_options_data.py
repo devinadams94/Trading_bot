@@ -142,7 +142,9 @@ class OptimizedHistoricalOptionsDataLoader:
         self._data_lock = threading.RLock()
 
         # Enhanced rate limiting
-        self.rate_limit_delay = rate_limit_delay
+        # Polygon.io free tier: 5 requests per minute = 12 seconds per request
+        # Use 15 seconds to be safe and avoid rate limits
+        self.rate_limit_delay = max(rate_limit_delay, 15.0)  # At least 15 seconds between requests
         self.last_request_time = 0
         self.request_count = 0
         self.rate_limit_lock = threading.Lock()
@@ -152,7 +154,7 @@ class OptimizedHistoricalOptionsDataLoader:
 
         # Cache management
         self.cache_index = self._load_cache_index()
-        self.min_request_interval = 0.2  # 200ms between requests
+        self.min_request_interval = 15.0  # 15 seconds between requests for free tier
 
         # WebSocket connection state (separate connections for stocks and options)
         self.ws_connection_stocks = None
@@ -911,13 +913,41 @@ class OptimizedHistoricalOptionsDataLoader:
                                         day_data = opt.get('day', {})
                                         greeks = opt.get('greeks', {})
 
+                                        # Get basic option data
+                                        strike = details.get('strike_price', 0)
+                                        expiration_str = details.get('expiration_date', '')
+                                        option_type = details.get('contract_type', 'call')
+                                        implied_vol = opt.get('implied_volatility', 0)
+
+                                        # Calculate Rho if Polygon doesn't provide it
+                                        rho = greeks.get('rho', 0)
+                                        if rho == 0 and strike > 0 and stock_price > 0 and implied_vol > 0:
+                                            # Calculate days to expiration
+                                            try:
+                                                from datetime import datetime
+                                                exp_date = datetime.strptime(expiration_str, '%Y-%m-%d')
+                                                dte = (exp_date - date).days
+                                                if dte > 0:
+                                                    # Calculate Rho using Black-Scholes
+                                                    rho = self._calculate_rho(
+                                                        stock_price=stock_price,
+                                                        strike=strike,
+                                                        time_to_expiry=dte / 365.0,
+                                                        implied_vol=implied_vol,
+                                                        option_type=option_type,
+                                                        risk_free_rate=0.05  # Assume 5% risk-free rate
+                                                    )
+                                            except Exception as e:
+                                                logger.debug(f"Error calculating Rho: {e}")
+                                                rho = 0
+
                                         option_dict = {
                                             'timestamp': date,
                                             'symbol': symbol,
                                             'option_symbol': details.get('ticker', ''),
-                                            'option_type': details.get('contract_type', 'call'),
-                                            'strike': details.get('strike_price', 0),
-                                            'expiration': details.get('expiration_date', ''),
+                                            'option_type': option_type,
+                                            'strike': strike,
+                                            'expiration': expiration_str,
                                             'bid': day_data.get('close', 0) * 0.98,  # Approximate bid
                                             'ask': day_data.get('close', 0) * 1.02,  # Approximate ask
                                             'last': day_data.get('close', 0),
@@ -928,8 +958,8 @@ class OptimizedHistoricalOptionsDataLoader:
                                             'gamma': greeks.get('gamma', 0),
                                             'theta': greeks.get('theta', 0),
                                             'vega': greeks.get('vega', 0),
-                                            'rho': greeks.get('rho', 0),
-                                            'implied_volatility': opt.get('implied_volatility', 0),
+                                            'rho': rho,
+                                            'implied_volatility': implied_vol,
                                         }
                                         options_list.append(option_dict)
                                     except Exception as e:
@@ -959,15 +989,17 @@ class OptimizedHistoricalOptionsDataLoader:
         self,
         symbol: str,
         start_date: datetime,
-        end_date: datetime
+        end_date: datetime,
+        max_retries: int = 5
     ) -> pd.DataFrame:
         """
-        Fetch historical stock data using Massive.com (Polygon.io) REST API
+        Fetch historical stock data using Massive.com (Polygon.io) REST API with retry logic
 
         Args:
             symbol: Stock symbol (e.g., 'SPY')
             start_date: Start date for historical data
             end_date: End date for historical data
+            max_retries: Maximum number of retries for rate limit errors
 
         Returns:
             DataFrame with columns: timestamp, symbol, open, high, low, close, volume
@@ -993,49 +1025,63 @@ class OptimizedHistoricalOptionsDataLoader:
                 # Create SSL context with certifi CA bundle
                 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                        if response.status == 200:
-                            data = await response.json()
+                # Retry logic for rate limiting
+                for attempt in range(max_retries):
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                            if response.status == 200:
+                                data = await response.json()
 
-                            if data.get('status') == 'OK' and 'results' in data:
-                                results = data['results']
+                                if data.get('status') == 'OK' and 'results' in data:
+                                    results = data['results']
 
-                                if len(results) == 0:
-                                    logger.warning(f"No stock data returned for {symbol}")
+                                    if len(results) == 0:
+                                        logger.warning(f"No stock data returned for {symbol}")
+                                        return None
+
+                                    # Convert to DataFrame
+                                    df = pd.DataFrame(results)
+
+                                    # Rename columns to match our format
+                                    df = df.rename(columns={
+                                        't': 'timestamp',
+                                        'o': 'open',
+                                        'h': 'high',
+                                        'l': 'low',
+                                        'c': 'close',
+                                        'v': 'volume',
+                                        'vw': 'vwap',
+                                        'n': 'transactions'
+                                    })
+
+                                    # Convert timestamp from milliseconds to datetime
+                                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                                    df['symbol'] = symbol
+
+                                    # Select only the columns we need
+                                    df = df[['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+
+                                    logger.info(f"✅ Fetched {len(df)} bars for {symbol} from REST API")
+                                    return df
+                                else:
+                                    logger.error(f"API returned status: {data.get('status')}, message: {data.get('message', 'No message')}")
                                     return None
 
-                                # Convert to DataFrame
-                                df = pd.DataFrame(results)
+                            elif response.status == 429:
+                                # Rate limit hit - exponential backoff
+                                wait_time = min(60, (2 ** attempt) * 2)  # 2, 4, 8, 16, 32, max 60 seconds
+                                logger.warning(f"⏱️  Rate limit hit for {symbol} (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                                continue  # Retry
 
-                                # Rename columns to match our format
-                                df = df.rename(columns={
-                                    't': 'timestamp',
-                                    'o': 'open',
-                                    'h': 'high',
-                                    'l': 'low',
-                                    'c': 'close',
-                                    'v': 'volume',
-                                    'vw': 'vwap',
-                                    'n': 'transactions'
-                                })
-
-                                # Convert timestamp from milliseconds to datetime
-                                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                                df['symbol'] = symbol
-
-                                # Select only the columns we need
-                                df = df[['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
-
-                                logger.info(f"✅ Fetched {len(df)} bars for {symbol} from REST API")
-                                return df
                             else:
-                                logger.error(f"API returned status: {data.get('status')}, message: {data.get('message', 'No message')}")
+                                error_text = await response.text()
+                                logger.error(f"HTTP {response.status} error fetching stock data for {symbol}: {error_text}")
                                 return None
-                        else:
-                            error_text = await response.text()
-                            logger.error(f"HTTP {response.status} error fetching stock data for {symbol}: {error_text}")
-                            return None
+
+                # If we exhausted all retries
+                logger.error(f"❌ Failed to fetch {symbol} after {max_retries} retries due to rate limiting")
+                return None
 
             except ImportError:
                 logger.error("aiohttp not installed. Install with: pip install aiohttp")
@@ -1227,6 +1273,77 @@ class OptimizedHistoricalOptionsDataLoader:
             logger.debug(f"Error filtering options chain: {e}")
 
         return filtered_options
+
+    def _calculate_rho(
+        self,
+        stock_price: float,
+        strike: float,
+        time_to_expiry: float,
+        implied_vol: float,
+        option_type: str,
+        risk_free_rate: float = 0.05
+    ) -> float:
+        """
+        Calculate Rho (sensitivity to interest rate changes) using Black-Scholes
+
+        Args:
+            stock_price: Current stock price
+            strike: Option strike price
+            time_to_expiry: Time to expiration in years
+            implied_vol: Implied volatility (as decimal, e.g., 0.25 for 25%)
+            option_type: 'call' or 'put'
+            risk_free_rate: Risk-free interest rate (default: 0.05 for 5%)
+
+        Returns:
+            Rho value (change in option price per 1% change in interest rate)
+        """
+        import math
+
+        try:
+            # Avoid division by zero
+            if time_to_expiry <= 0 or implied_vol <= 0 or stock_price <= 0 or strike <= 0:
+                return 0.0
+
+            # Calculate d1 and d2 from Black-Scholes
+            d1 = (math.log(stock_price / strike) +
+                  (risk_free_rate + 0.5 * implied_vol**2) * time_to_expiry) / \
+                 (implied_vol * math.sqrt(time_to_expiry))
+            d2 = d1 - implied_vol * math.sqrt(time_to_expiry)
+
+            if HAS_SCIPY:
+                # Use proper cumulative normal distribution
+                from scipy.stats import norm
+
+                if option_type.lower() == 'call':
+                    # Rho for call = K * T * e^(-rT) * N(d2) / 100
+                    rho = (strike * time_to_expiry *
+                           math.exp(-risk_free_rate * time_to_expiry) *
+                           norm.cdf(d2)) / 100
+                else:  # put
+                    # Rho for put = -K * T * e^(-rT) * N(-d2) / 100
+                    rho = -(strike * time_to_expiry *
+                            math.exp(-risk_free_rate * time_to_expiry) *
+                            norm.cdf(-d2)) / 100
+            else:
+                # Simplified approximation without scipy
+                # Use approximation: N(x) ≈ 0.5 * (1 + tanh(0.7978845608 * x))
+                def approx_cdf(x):
+                    return 0.5 * (1 + math.tanh(0.7978845608 * x))
+
+                if option_type.lower() == 'call':
+                    rho = (strike * time_to_expiry *
+                           math.exp(-risk_free_rate * time_to_expiry) *
+                           approx_cdf(d2)) / 100
+                else:  # put
+                    rho = -(strike * time_to_expiry *
+                            math.exp(-risk_free_rate * time_to_expiry) *
+                            approx_cdf(-d2)) / 100
+
+            return rho
+
+        except Exception as e:
+            logger.debug(f"Error calculating Rho: {e}")
+            return 0.0
 
     def _simulate_option_pricing(
         self,
