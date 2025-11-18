@@ -766,9 +766,6 @@ class EnhancedCLSTMPPOTrainer:
                 'window_size': window
             }
             self._save_checkpoint("best_composite")
-        else:
-            # Increment early stopping counter
-            self.episodes_without_improvement += 1
 
             # Log detailed breakdown
             logger.info(f"🏆 NEW BEST COMPOSITE SCORE: {current_composite_score:.1%} ({composite_type}) (episode {self.episode})")
@@ -781,6 +778,9 @@ class EnhancedCLSTMPPOTrainer:
                 logger.info(f"      Win Rate (rolling): {current_win_rate_rolling:.1%}")
                 logger.info(f"      Profit Rate: {current_profit_rate:.1%}")
                 logger.info(f"      Avg Return: {avg_return:.1%}")
+        else:
+            # Increment early stopping counter
+            self.episodes_without_improvement += 1
 
         # Save best win rate model
         if new_best_win_rate:
@@ -1310,7 +1310,10 @@ class EnhancedCLSTMPPOTrainer:
 
             # Log action distribution every 50 steps
             if step % 50 == 0:
-                logger.info(f"Step {step}: action={action}, reward={reward:.4f}, trades={step_info.get('num_trades', 0)}")
+                trade_executed = step_info.get('trade_executed', False)
+                total_trades = step_info.get('episode_trades', 0)
+                action_name = step_info.get('action_name', f'action_{action}')
+                logger.info(f"Step {step}: {action_name}, reward={reward:.4f}, trade={'YES' if trade_executed else 'NO'}, total_trades={total_trades}")
 
             # Apply paper's enhanced reward function
             if self.config.get('use_portfolio_return_reward', False):
@@ -1388,12 +1391,17 @@ class EnhancedCLSTMPPOTrainer:
             action_counts[a] = action_counts.get(a, 0) + 1
         unique_actions = len(action_counts)
         most_common_action = max(action_counts.items(), key=lambda x: x[1]) if action_counts else (0, 0)
-        logger.info(f"Episode {self.episode}: {unique_actions} unique actions, most common: action {most_common_action[0]} ({most_common_action[1]} times), trades: {episode_trades}")
 
         # Calculate win rate
         profitable_trades = sum(1 for trade in self.env.trade_history if trade.get('pnl', 0) > 0)
         total_trades_this_episode = len(self.env.trade_history)
         win_rate = profitable_trades / max(1, total_trades_this_episode)
+
+        # Enhanced episode summary
+        logger.info(f"Episode {self.episode} Summary:")
+        logger.info(f"  Actions: {unique_actions} unique, most common: action {most_common_action[0]} ({most_common_action[1]} times)")
+        logger.info(f"  Trades: {episode_trades} executed, {profitable_trades} profitable ({win_rate:.1%} win rate)")
+        logger.info(f"  Return: {portfolio_return:.2%}, Portfolio Value: ${portfolio_value:,.2f}")
 
         # Record metrics
         self.episode_returns.append(portfolio_return)
@@ -1782,6 +1790,8 @@ async def main():
     # Early stopping
     parser.add_argument('--early-stopping-patience', type=int, default=500,
                         help='Stop training if no improvement for N episodes (0 to disable, default: 500)')
+    parser.add_argument('--no-early-stopping', action='store_true', default=False,
+                        help='Disable early stopping (equivalent to --early-stopping-patience 0)')
     parser.add_argument('--early-stopping-min-delta', type=float, default=0.001,
                         help='Minimum improvement to reset patience (default: 0.001)')
 
@@ -1932,7 +1942,7 @@ async def main():
         'enable_slippage': args.use_realistic_costs,  # Disable slippage if costs disabled
         'slippage_model': 'volume_based' if args.use_realistic_costs else 'none',
         # Early stopping
-        'early_stopping_patience': args.early_stopping_patience,
+        'early_stopping_patience': 0 if args.no_early_stopping else args.early_stopping_patience,
         'early_stopping_min_delta': args.early_stopping_min_delta,
         # Data source (flat files vs REST API)
         'use_flat_files': args.use_flat_files,
