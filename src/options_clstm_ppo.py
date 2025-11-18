@@ -802,28 +802,48 @@ class OptionsCLSTMPPOAgent:
         return stacked
     
     def save(self, path: str):
-        """Save both CLSTM and PPO models"""
+        """Save both CLSTM and PPO models with observation space metadata"""
+        # Get action_dim from the actor network's output layer
+        action_dim = self.base_network.actor[-1].out_features
+
+        # Save observation space dimensions for compatibility checking
+        obs_space_metadata = {
+            'input_dim': self.base_network.clstm_encoder.input_dim,
+            'hidden_dim': self.base_network.clstm_encoder.hidden_dim,
+            'num_layers': self.base_network.clstm_encoder.num_layers,
+            'action_dim': action_dim,
+            'has_symbol_encoding': self.base_network.has_symbol_encoding,
+        }
+
         checkpoint_data = {
             'network_state_dict': self.network.state_dict(),
             'ppo_optimizer_state_dict': self.ppo_optimizer.state_dict(),
             'clstm_optimizer_state_dict': self.clstm_optimizer.state_dict(),
             'training_step': self.training_step,
             'feature_memory': list(self.base_network.feature_memory),
+            'observation_space_metadata': obs_space_metadata,
             '_save_metadata': {
                 'pytorch_version': torch.__version__,
                 'save_timestamp': datetime.now().isoformat(),
                 'safe_format': True
             }
         }
-        
+
         try:
             torch.save(checkpoint_data, path)
             logger.info(f"CLSTM-PPO model saved to {path}")
+            logger.debug(f"  Input dim: {obs_space_metadata['input_dim']}, Hidden dim: {obs_space_metadata['hidden_dim']}")
         except Exception as e:
             logger.error(f"Failed to save CLSTM-PPO model to {path}: {e}")
     
-    def load(self, path: str):
-        """Load both CLSTM and PPO models"""
+    def load(self, path: str, strict: bool = False):
+        """
+        Load both CLSTM and PPO models with flexible dimension handling
+
+        Args:
+            path: Path to checkpoint file
+            strict: If True, require exact match. If False, allow partial loading with dimension mismatch
+        """
         try:
             # Add safe globals for PyTorch 2.6+ compatibility
             import torch.serialization
@@ -864,25 +884,118 @@ class OptionsCLSTMPPOAgent:
                 state_dict = new_state_dict
                 logger.debug("Added _orig_mod. prefix for compiled model")
 
-            # Load the model components with fixed state dict
-            if isinstance(checkpoint, dict) and 'network_state_dict' in checkpoint:
-                # Full checkpoint with optimizer states
-                self.network.load_state_dict(state_dict)
-                self.ppo_optimizer.load_state_dict(checkpoint['ppo_optimizer_state_dict'])
-                self.clstm_optimizer.load_state_dict(checkpoint['clstm_optimizer_state_dict'])
-                self.training_step = checkpoint['training_step']
+            # Check for observation space dimension mismatch
+            obs_metadata = checkpoint.get('observation_space_metadata', {})
+            current_input_dim = self.base_network.clstm_encoder.input_dim
+            checkpoint_input_dim = obs_metadata.get('input_dim', None)
+
+            # If no metadata, try to infer from the input_projection layer shape
+            if checkpoint_input_dim is None:
+                # Look for input_projection weight in state_dict
+                input_proj_key = None
+                for key in state_dict.keys():
+                    if 'clstm_encoder.input_projection.weight' in key:
+                        input_proj_key = key
+                        break
+
+                if input_proj_key and input_proj_key in state_dict:
+                    # Shape is [hidden_dim, input_dim]
+                    checkpoint_input_dim = state_dict[input_proj_key].shape[1]
+                    logger.debug(f"Inferred checkpoint input dim from layer shape: {checkpoint_input_dim}")
+
+            dimension_mismatch = False
+            if checkpoint_input_dim is not None and checkpoint_input_dim != current_input_dim:
+                dimension_mismatch = True
+                logger.warning(f"⚠️  Observation space dimension mismatch detected:")
+                logger.warning(f"   Checkpoint input dim: {checkpoint_input_dim}")
+                logger.warning(f"   Current model input dim: {current_input_dim}")
+                logger.warning(f"   Difference: {current_input_dim - checkpoint_input_dim} dimensions")
+
+                if strict:
+                    raise ValueError(
+                        f"Observation space mismatch: checkpoint has {checkpoint_input_dim} dims, "
+                        f"current model has {current_input_dim} dims. Use strict=False for partial loading."
+                    )
+                else:
+                    logger.info("🔧 Attempting partial weight transfer (keeping LSTM/attention weights)...")
+
+            # Load the model components
+            if dimension_mismatch and not strict:
+                # Partial loading: skip input_projection layer, load everything else
+                loaded_keys = []
+                skipped_keys = []
+
+                current_state = self.network.state_dict()
+
+                for key, value in state_dict.items():
+                    # Skip input projection layer (dimension-dependent)
+                    if 'clstm_encoder.input_projection' in key:
+                        skipped_keys.append(key)
+                        logger.debug(f"  Skipping (dimension mismatch): {key}")
+                        continue
+
+                    # Skip symbol_embedding if it exists and dimensions don't match
+                    if 'symbol_embedding' in key:
+                        if key in current_state and current_state[key].shape != value.shape:
+                            skipped_keys.append(key)
+                            logger.debug(f"  Skipping (dimension mismatch): {key}")
+                            continue
+
+                    # Load matching layers
+                    if key in current_state:
+                        if current_state[key].shape == value.shape:
+                            current_state[key] = value
+                            loaded_keys.append(key)
+                        else:
+                            skipped_keys.append(key)
+                            logger.debug(f"  Skipping (shape mismatch): {key} - checkpoint: {value.shape}, current: {current_state[key].shape}")
+                    else:
+                        skipped_keys.append(key)
+                        logger.debug(f"  Skipping (not in current model): {key}")
+
+                # Load the modified state dict
+                self.network.load_state_dict(current_state)
+
+                logger.info(f"✅ Partial loading complete:")
+                logger.info(f"   Loaded: {len(loaded_keys)} layers")
+                logger.info(f"   Skipped: {len(skipped_keys)} layers (dimension mismatch)")
+                logger.info(f"   Input projection layer will be trained from scratch")
+
+                # DO NOT load optimizer states when there's a dimension mismatch
+                # The optimizer states contain per-parameter momentum/variance which won't match
+                logger.warning(f"⚠️  Optimizer states NOT loaded due to architecture change")
+                logger.warning(f"   Optimizers will start fresh (this is expected and safe)")
+
+                if 'training_step' in checkpoint:
+                    self.training_step = checkpoint['training_step']
+                    logger.info(f"   Resuming from training step: {self.training_step}")
+
             else:
-                # Just state dict (older format)
-                self.network.load_state_dict(state_dict)
-            
-            # Restore feature memory
+                # Full loading (exact match or strict mode)
+                if isinstance(checkpoint, dict) and 'network_state_dict' in checkpoint:
+                    # Full checkpoint with optimizer states
+                    self.network.load_state_dict(state_dict, strict=strict)
+                    self.ppo_optimizer.load_state_dict(checkpoint['ppo_optimizer_state_dict'])
+                    self.clstm_optimizer.load_state_dict(checkpoint['clstm_optimizer_state_dict'])
+                    self.training_step = checkpoint['training_step']
+                else:
+                    # Just state dict (older format)
+                    self.network.load_state_dict(state_dict, strict=strict)
+
+                logger.info(f"✅ Full checkpoint loaded successfully")
+
+            # Restore feature memory (if compatible)
             if 'feature_memory' in checkpoint:
-                self.base_network.feature_memory.clear()
-                for feat in checkpoint['feature_memory']:
-                    self.base_network.feature_memory.append(feat)
-            
+                try:
+                    self.base_network.feature_memory.clear()
+                    for feat in checkpoint['feature_memory']:
+                        self.base_network.feature_memory.append(feat)
+                    logger.debug("   Feature memory restored")
+                except Exception as e:
+                    logger.warning(f"   Could not restore feature memory: {e}")
+
             logger.info(f"CLSTM-PPO model successfully loaded from {path}")
-            
+
         except Exception as e:
             logger.error(f"Failed to load CLSTM-PPO model from {path}: {e}")
             raise
