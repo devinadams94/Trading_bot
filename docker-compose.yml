@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: clstm-ppo-trading-bot:latest
+    container_name: trading_bot
+    runtime: nvidia  # For GPU support
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
+    volumes:
+      # Mount data directory for persistence
+      - ./data:/app/data
+      # Mount logs and outputs
+      - ./logs:/app/logs
+      - ./runs:/app/runs
+      - ./checkpoints:/app/checkpoints
+      # Mount .env file if it exists
+      - ./.env:/app/.env:ro
+    ports:
+      - "6006:6006"  # TensorBoard
+    command: python3 train_enhanced_clstm_ppo.py --use-flat-files --episodes 5000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  tensorboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: clstm-ppo-trading-bot:latest
+    container_name: tensorboard
+    volumes:
+      - ./runs:/app/runs:ro
+    ports:
+      - "6006:6006"
+    command: tensorboard --logdir=/app/runs --host=0.0.0.0 --port=6006
+    profiles:
+      - monitoring
+
+  data-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: clstm-ppo-trading-bot:latest
+    container_name: data_downloader
+    environment:
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    command: python3 download_data_to_flat_files.py --days 730
+    profiles:
+      - data
+
