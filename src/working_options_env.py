@@ -115,7 +115,13 @@ class WorkingOptionsEnvironment(gym.Env):
         else:
             self.cost_calculator = None
             logger.info(f"⚠️ Using legacy commission model (${commission} per trade)")
-        
+
+        # OPTIMIZATION: Cache for Greeks lookups and technical indicators
+        self._greeks_cache = {}  # Key: (symbol, strike, option_type) -> Greeks dict
+        self._technical_indicators_cache = {}  # Key: (symbol, step) -> indicators dict
+        self._cache_hits = 0
+        self._cache_misses = 0
+
         # Action space: 0=hold, 1-10=buy calls, 11-20=buy puts, 21-30=sell positions
         self.action_space = spaces.Discrete(31)
 
@@ -211,7 +217,7 @@ class WorkingOptionsEnvironment(gym.Env):
     
     def _find_option_contract(self, symbol: str, strike: float, option_type: str, tolerance: float = 0.5) -> Optional[Dict]:
         """
-        Find matching option contract from loaded options data
+        Find matching option contract from loaded options data (OPTIMIZED with caching)
 
         Args:
             symbol: Underlying symbol
@@ -222,7 +228,16 @@ class WorkingOptionsEnvironment(gym.Env):
         Returns:
             Option contract dict with Greeks, or None if not found
         """
+        # OPTIMIZATION: Check cache first
+        cache_key = (symbol, round(strike, 2), option_type.lower())
+        if cache_key in self._greeks_cache:
+            self._cache_hits += 1
+            return self._greeks_cache[cache_key]
+
+        self._cache_misses += 1
+
         if not hasattr(self, 'options_data') or symbol not in self.options_data:
+            self._greeks_cache[cache_key] = None
             return None
 
         # Find options with matching strike and type
@@ -233,10 +248,13 @@ class WorkingOptionsEnvironment(gym.Env):
         ]
 
         if not matching_options:
+            self._greeks_cache[cache_key] = None
             return None
 
         # Return the closest match by strike
-        return min(matching_options, key=lambda x: abs(x.get('strike', 0) - strike))
+        result = min(matching_options, key=lambda x: abs(x.get('strike', 0) - strike))
+        self._greeks_cache[cache_key] = result
+        return result
 
     def _create_synthetic_data(self, start_date: datetime, end_date: datetime):
         """Create synthetic market data"""
@@ -276,11 +294,25 @@ class WorkingOptionsEnvironment(gym.Env):
         self.trade_history = []
         self.current_data_index = 0
         self.current_symbol = self.symbols[0] if self.symbols else 'SPY'
-        
+
         # Portfolio tracking
         self.portfolio_value_history = [self.initial_capital]
         self.peak_portfolio_value = self.initial_capital
-        
+
+        # OPTIMIZATION: Clear caches to prevent memory leaks
+        # Keep Greeks cache (static data) but clear technical indicators cache (step-dependent)
+        self._technical_indicators_cache.clear()
+
+        # Log cache statistics periodically (every 100 episodes)
+        if hasattr(self, '_reset_count'):
+            self._reset_count += 1
+            if self._reset_count % 100 == 0:
+                total_lookups = self._cache_hits + self._cache_misses
+                hit_rate = (self._cache_hits / total_lookups * 100) if total_lookups > 0 else 0
+                logger.info(f"📊 Cache stats: {self._cache_hits} hits, {self._cache_misses} misses ({hit_rate:.1f}% hit rate)")
+        else:
+            self._reset_count = 0
+
         return self._get_observation()
 
     def _calculate_transaction_cost(self, option_data: Dict, quantity: int, side: str = 'buy') -> Tuple[float, Dict]:
@@ -837,21 +869,21 @@ class WorkingOptionsEnvironment(gym.Env):
             self.current_step / self.episode_length  # Episode progress
         ], dtype=np.float32)
 
-        # Greeks summary - extract from current positions
+        # OPTIMIZATION: Vectorized Greeks summary extraction
         greeks_summary = np.zeros(self.max_positions * 4, dtype=np.float32)
 
-        for i, position in enumerate(self.positions[:self.max_positions]):
-            # Extract Greeks from position (stored when position was opened)
-            delta = position.get('delta', 0.0)
-            gamma = position.get('gamma', 0.0)
-            theta = position.get('theta', 0.0)
-            vega = position.get('vega', 0.0)
-
-            # Populate greeks_summary: [delta, gamma, theta, vega] for each position
-            greeks_summary[i*4 + 0] = delta
-            greeks_summary[i*4 + 1] = gamma
-            greeks_summary[i*4 + 2] = theta
-            greeks_summary[i*4 + 3] = vega
+        if self.positions:
+            # Extract Greeks from positions in vectorized manner
+            num_positions = min(len(self.positions), self.max_positions)
+            for i in range(num_positions):
+                position = self.positions[i]
+                # Use array slicing for faster assignment
+                greeks_summary[i*4:(i+1)*4] = [
+                    position.get('delta', 0.0),
+                    position.get('gamma', 0.0),
+                    position.get('theta', 0.0),
+                    position.get('vega', 0.0)
+                ]
 
         # Symbol encoding (one-hot for current primary symbol)
         symbol_encoding = np.zeros(num_symbols, dtype=np.float32)
@@ -1055,17 +1087,24 @@ class WorkingOptionsEnvironment(gym.Env):
 
     def get_enhanced_technical_indicators(self, symbol: str) -> Dict[str, float]:
         """
-        Get enhanced technical indicators as used in the paper
+        Get enhanced technical indicators as used in the paper (OPTIMIZED with caching)
         Includes MACD, RSI, CCI, ADX
         """
+        # OPTIMIZATION: Check cache first (cache per step to avoid recalculation)
+        cache_key = (symbol, self.current_step)
+        if cache_key in self._technical_indicators_cache:
+            return self._technical_indicators_cache[cache_key]
+
         try:
             if symbol not in self.market_data or len(self.market_data[symbol]) < 30:
-                return {
+                result = {
                     'macd': 0.0,
                     'rsi': 50.0,
                     'cci': 0.0,
                     'adx': 25.0
                 }
+                self._technical_indicators_cache[cache_key] = result
+                return result
 
             data = self.market_data[symbol]
             close_prices = data['close']
@@ -1078,18 +1117,22 @@ class WorkingOptionsEnvironment(gym.Env):
             cci = TechnicalIndicators.calculate_cci(high_prices, low_prices, close_prices)
             adx = TechnicalIndicators.calculate_adx(high_prices, low_prices, close_prices)
 
-            return {
+            result = {
                 'macd': macd,
                 'rsi': rsi,
                 'cci': cci,
                 'adx': adx
             }
+            self._technical_indicators_cache[cache_key] = result
+            return result
 
         except Exception as e:
             logger.debug(f"Error calculating enhanced technical indicators for {symbol}: {e}")
-            return {
+            result = {
                 'macd': 0.0,
                 'rsi': 50.0,
                 'cci': 0.0,
                 'adx': 25.0
             }
+            self._technical_indicators_cache[cache_key] = result
+            return result
