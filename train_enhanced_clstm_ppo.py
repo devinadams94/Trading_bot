@@ -892,12 +892,28 @@ class EnhancedCLSTMPPOTrainer:
                 'config': self.config
             }
 
-            # Save training state
+            # BUGFIX: Save training state with backup to prevent corruption
             checkpoint_path = self.checkpoint_dir / "training_state.json"
+            backup_path = self.checkpoint_dir / "training_state.json.backup"
+
             if self.is_main_process:
                 logger.info(f"   Writing training state to: {checkpoint_path}")
-            with open(checkpoint_path, 'w') as f:
+
+            # Create backup of existing checkpoint before overwriting
+            if checkpoint_path.exists():
+                try:
+                    import shutil
+                    shutil.copy2(checkpoint_path, backup_path)
+                except Exception as backup_err:
+                    logger.warning(f"⚠️ Failed to create backup: {backup_err}")
+
+            # Write to temporary file first, then rename (atomic operation)
+            temp_path = self.checkpoint_dir / "training_state.json.tmp"
+            with open(temp_path, 'w') as f:
                 json.dump(checkpoint, f, indent=2)
+
+            # Atomic rename (prevents corruption if process is killed during write)
+            temp_path.replace(checkpoint_path)
             if self.is_main_process:
                 logger.info(f"   ✅ Training state saved ({checkpoint_path.stat().st_size} bytes)")
 
@@ -987,14 +1003,41 @@ class EnhancedCLSTMPPOTrainer:
             logger.error(traceback.format_exc())
 
     def _load_checkpoint(self) -> bool:
-        """Load training checkpoint"""
+        """Load training checkpoint with robust error handling"""
         try:
             checkpoint_path = self.checkpoint_dir / "training_state.json"
             if not checkpoint_path.exists():
                 return False
 
-            with open(checkpoint_path, 'r') as f:
-                checkpoint = json.load(f)
+            # BUGFIX: Validate JSON file before loading
+            # Check if file is empty or corrupted
+            if checkpoint_path.stat().st_size == 0:
+                logger.warning("⚠️ Checkpoint file is empty, starting fresh")
+                return False
+
+            # Try to load JSON with better error handling
+            try:
+                with open(checkpoint_path, 'r') as f:
+                    checkpoint = json.load(f)
+            except json.JSONDecodeError as json_err:
+                # JSON is corrupted - try to recover from backup or start fresh
+                logger.error(f"❌ Checkpoint JSON is corrupted: {json_err}")
+
+                # Check for backup file
+                backup_path = self.checkpoint_dir / "training_state.json.backup"
+                if backup_path.exists():
+                    logger.info("🔄 Attempting to load from backup...")
+                    try:
+                        with open(backup_path, 'r') as f:
+                            checkpoint = json.load(f)
+                        logger.info("✅ Successfully loaded from backup")
+                    except Exception as backup_err:
+                        logger.error(f"❌ Backup also corrupted: {backup_err}")
+                        logger.warning("⚠️ Starting fresh training due to corrupted checkpoint")
+                        return False
+                else:
+                    logger.warning("⚠️ No backup found, starting fresh training")
+                    return False
 
             # Restore training state
             self.episode = checkpoint.get('episode', 0)
@@ -1308,8 +1351,9 @@ class EnhancedCLSTMPPOTrainer:
             # Execute step
             next_obs, reward, done, step_info = self.env.step(action)
 
-            # Log action distribution every 50 steps
-            if step % 50 == 0:
+            # OPTIMIZATION: Reduce logging frequency (every 100 steps instead of 50)
+            # Can be disabled entirely with --no-step-logging for maximum speed
+            if not self.config.get('no_step_logging', False) and step % 100 == 0 and step > 0:
                 trade_executed = step_info.get('trade_executed', False)
                 total_trades = step_info.get('episode_trades', 0)
                 action_name = step_info.get('action_name', f'action_{action}')
@@ -1801,6 +1845,10 @@ async def main():
     parser.add_argument('--quick-test', action='store_true',
                         help='Quick test mode: 3 symbols, 90 days data, 100 episodes')
 
+    # Performance optimization
+    parser.add_argument('--no-step-logging', action='store_true', default=False,
+                        help='Disable step-by-step logging for maximum training speed')
+
     # Transaction costs
     parser.add_argument('--realistic-costs', dest='use_realistic_costs', action='store_true', default=True,
                         help='Use realistic transaction costs (default: enabled)')
@@ -1944,6 +1992,8 @@ async def main():
         # Early stopping
         'early_stopping_patience': 0 if args.no_early_stopping else args.early_stopping_patience,
         'early_stopping_min_delta': args.early_stopping_min_delta,
+        # Performance optimization
+        'no_step_logging': args.no_step_logging,
         # Data source (flat files vs REST API)
         'use_flat_files': args.use_flat_files,
         'flat_files_dir': args.flat_files_dir,
