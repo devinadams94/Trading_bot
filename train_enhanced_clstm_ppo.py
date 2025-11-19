@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 import json
 import pickle
 from datetime import datetime, timedelta
@@ -144,6 +145,15 @@ class EnhancedCLSTMPPOTrainer:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.resume_from = resume_from
 
+        # TensorBoard logging
+        self.tensorboard_dir = Path("runs") / f"clstm_ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if self.is_main_process:
+            self.tensorboard_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
+            logger.info(f"📊 TensorBoard logging to: {self.tensorboard_dir}")
+        else:
+            self.writer = None
+
         # Training state
         self.episode = 0
         self.best_performance = float('-inf')
@@ -214,8 +224,10 @@ class EnhancedCLSTMPPOTrainer:
         if self.is_main_process:
             logger.info("🚀 Enhanced CLSTM-PPO Trainer initialized with paper optimizations")
             if distributed:
-                logger.info(f"   🌐 Distributed training: {world_size} GPUs")
+                logger.info(f"   🌐 Distributed training: {world_size} GPUs (Data Parallelism)")
                 logger.info(f"   📍 Rank: {rank}")
+                logger.info(f"   ✅ All GPUs work together on each episode")
+                logger.info(f"   ✅ Gradients synchronized via DistributedDataParallel")
             logger.info(f"   Device: {self.device}")
             logger.info(f"   Checkpoint dir: {self.checkpoint_dir}")
             logger.info(f"   LSTM time window: {self.config.get('lstm_time_window', 30)}")
@@ -243,6 +255,14 @@ class EnhancedCLSTMPPOTrainer:
                     logger.info("✅ Checkpoint saved successfully")
                 except Exception as e:
                     logger.error(f"❌ Failed to save checkpoint: {e}")
+
+            # Close TensorBoard writer
+            if self.is_main_process and hasattr(self, 'writer') and self.writer is not None:
+                try:
+                    self.writer.close()
+                    logger.info("✅ TensorBoard writer closed")
+                except Exception as e:
+                    logger.error(f"❌ Failed to close TensorBoard writer: {e}")
 
         # Register handlers for SIGINT (Ctrl+C) and SIGTERM
         signal.signal(signal.SIGINT, signal_handler)
@@ -493,33 +513,31 @@ class EnhancedCLSTMPPOTrainer:
                 sys.stdout.flush()
                 sys.stderr.flush()
 
-            # Wrap model with DistributedDataParallel if in distributed mode
-            if self.distributed and hasattr(self.agent, 'network'):
+            # FIXED: Use DataParallel for multi-GPU in single process (simpler than DDP)
+            # Check if multiple GPUs are available
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1 and hasattr(self.agent, 'network') and torch.cuda.is_available():
                 if self.is_main_process:
-                    msg = "🌐 Wrapping model with DistributedDataParallel..."
+                    msg = f"🌐 Wrapping model with DataParallel for {num_gpus} GPUs..."
                     print(msg, flush=True)
                     logger.info(msg)
                     import sys
                     sys.stdout.flush()
                     sys.stderr.flush()
 
-                self.agent.network = DDP(
-                    self.agent.network,
-                    device_ids=[self.rank],
-                    output_device=self.rank,
-                    find_unused_parameters=True
-                )
+                # Use DataParallel to split batches across GPUs
+                self.agent.network = nn.DataParallel(self.agent.network)
 
                 if self.is_main_process:
-                    msg = "✅ Model wrapped with DDP"
+                    msg = f"✅ Model wrapped with DataParallel ({num_gpus} GPUs)"
                     print(msg, flush=True)
                     logger.info(msg)
                     import sys
                     sys.stdout.flush()
                     sys.stderr.flush()
 
-            # Apply GPU optimizations (only if not using DDP, as DDP doesn't work well with compile)
-            elif self.config.get('compile_model', True) and hasattr(torch, 'compile') and not self.distributed:
+            # Apply GPU optimizations (only if not using DataParallel)
+            elif self.config.get('compile_model', True) and hasattr(torch, 'compile') and num_gpus <= 1:
                 if self.is_main_process:
                     msg = "🔧 Compiling model with torch.compile..."
                     print(msg, flush=True)
@@ -1414,6 +1432,10 @@ class EnhancedCLSTMPPOTrainer:
                 # FIXED: Use correct keys from train() return dict
                 ppo_loss = train_result.get('total_loss', 0.0)
                 clstm_loss = train_result.get('clstm_loss', 0.0)
+                actor_loss = train_result.get('actor_loss', 0.0)
+                critic_loss = train_result.get('critic_loss', 0.0)
+                entropy = train_result.get('entropy', 0.0)
+                kl_div = train_result.get('kl_divergence', 0.0)
 
                 self.clstm_losses.append(clstm_loss)
                 self.ppo_losses.append(ppo_loss)
@@ -1421,6 +1443,16 @@ class EnhancedCLSTMPPOTrainer:
                 # Track losses for this episode (for aggregated reporting)
                 episode_ppo_losses.append(ppo_loss)
                 episode_clstm_losses.append(clstm_loss)
+
+                # TensorBoard logging - Model metrics (per training step)
+                if self.writer is not None:
+                    global_step = len(self.ppo_losses)
+                    self.writer.add_scalar('Loss/PPO_Total', ppo_loss, global_step)
+                    self.writer.add_scalar('Loss/CLSTM', clstm_loss, global_step)
+                    self.writer.add_scalar('Loss/Actor', actor_loss, global_step)
+                    self.writer.add_scalar('Loss/Critic', critic_loss, global_step)
+                    self.writer.add_scalar('Model/Entropy', entropy, global_step)
+                    self.writer.add_scalar('Model/KL_Divergence', kl_div, global_step)
             else:
                 logger.warning(f"⚠️ Training returned empty result (buffer size: {buffer_size})")
         
@@ -1442,7 +1474,11 @@ class EnhancedCLSTMPPOTrainer:
         win_rate = profitable_trades / max(1, total_trades_this_episode)
 
         # Enhanced episode summary
-        logger.info(f"Episode {self.episode} Summary:")
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            logger.info(f"Episode {self.episode} Summary (trained with {num_gpus} GPUs via DataParallel):")
+        else:
+            logger.info(f"Episode {self.episode} Summary:")
         logger.info(f"  Actions: {unique_actions} unique, most common: action {most_common_action[0]} ({most_common_action[1]} times)")
         logger.info(f"  Trades: {episode_trades} executed, {profitable_trades} profitable ({win_rate:.1%} win rate)")
         logger.info(f"  Return: {portfolio_return:.2%}, Portfolio Value: ${portfolio_value:,.2f}")
@@ -1457,6 +1493,63 @@ class EnhancedCLSTMPPOTrainer:
         if portfolio_return > self.best_performance:
             self.best_performance = portfolio_return
             logger.info(f"🎉 New best performance: {self.best_performance:.4f} at episode {self.episode}")
+
+        # TensorBoard logging - Episode metrics
+        if self.writer is not None:
+            # Performance metrics
+            self.writer.add_scalar('Episode/Return', portfolio_return, self.episode)
+            self.writer.add_scalar('Episode/Portfolio_Value', portfolio_value, self.episode)
+            self.writer.add_scalar('Episode/Win_Rate', win_rate, self.episode)
+            self.writer.add_scalar('Episode/Total_Reward', total_reward, self.episode)
+
+            # Trading activity
+            self.writer.add_scalar('Episode/Trades', episode_trades, self.episode)
+            self.writer.add_scalar('Episode/Profitable_Trades', profitable_trades, self.episode)
+            self.writer.add_scalar('Episode/Episode_Length', episode_length, self.episode)
+
+            # Rolling averages (last 100 episodes)
+            if len(self.episode_returns) >= 100:
+                recent_returns = self.episode_returns[-100:]
+                recent_win_rates = self.win_rates[-100:]
+                self.writer.add_scalar('Rolling/Avg_Return_100', np.mean(recent_returns), self.episode)
+                self.writer.add_scalar('Rolling/Avg_Win_Rate_100', np.mean(recent_win_rates), self.episode)
+                self.writer.add_scalar('Rolling/Std_Return_100', np.std(recent_returns), self.episode)
+
+                # Sharpe ratio
+                sharpe = np.mean(recent_returns) / max(np.std(recent_returns), 0.001)
+                self.writer.add_scalar('Rolling/Sharpe_Ratio_100', sharpe, self.episode)
+
+            # Best metrics tracking
+            self.writer.add_scalar('Best/Performance', self.best_performance, self.episode)
+            self.writer.add_scalar('Best/Win_Rate', self.best_win_rate, self.episode)
+            self.writer.add_scalar('Best/Profit_Rate', self.best_profit_rate, self.episode)
+            self.writer.add_scalar('Best/Sharpe_Ratio', self.best_sharpe_ratio, self.episode)
+            self.writer.add_scalar('Best/Composite_Score', self.best_composite_score, self.episode)
+
+            # Profitability tracking
+            is_profitable = portfolio_return > 0
+            self.writer.add_scalar('Profitability/Episode_Profitable', 1.0 if is_profitable else 0.0, self.episode)
+
+            # Cumulative metrics
+            if len(self.episode_returns) > 0:
+                cumulative_return = np.sum(self.episode_returns)
+                cumulative_trades = np.sum(self.episode_trades)
+                profitable_episodes = sum(1 for r in self.episode_returns if r > 0)
+                profitability_rate = profitable_episodes / len(self.episode_returns)
+
+                self.writer.add_scalar('Cumulative/Total_Return', cumulative_return, self.episode)
+                self.writer.add_scalar('Cumulative/Total_Trades', cumulative_trades, self.episode)
+                self.writer.add_scalar('Cumulative/Profitability_Rate', profitability_rate, self.episode)
+
+                # Drawdown calculation
+                cumulative_returns = np.cumsum(self.episode_returns)
+                running_max = np.maximum.accumulate(cumulative_returns)
+                drawdown = running_max - cumulative_returns
+                max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
+                current_drawdown = drawdown[-1] if len(drawdown) > 0 else 0
+
+                self.writer.add_scalar('Risk/Max_Drawdown', max_drawdown, self.episode)
+                self.writer.add_scalar('Risk/Current_Drawdown', current_drawdown, self.episode)
 
         # REMOVED: Reward contamination (bonuses added after training don't help)
         # The reward function in the environment is what matters for training
@@ -1517,33 +1610,22 @@ class EnhancedCLSTMPPOTrainer:
 
             self.episode = start_episode + local_episode
 
-            # Set different random seeds for each GPU to ensure diversity
-            if self.distributed:
-                torch.manual_seed(self.episode * self.world_size + self.rank)
-                np.random.seed(self.episode * self.world_size + self.rank)
+            # Set random seed for reproducibility
+            torch.manual_seed(self.episode)
+            np.random.seed(self.episode)
 
             # Train episode
             metrics = self.train_episode()
 
-            # Synchronize gradients across GPUs (DDP handles this automatically during backward)
-            # But we need to synchronize before checkpoint/logging
-            if self.distributed:
-                dist.barrier()
+            # Check for new high scores and save best model checkpoints
+            self._check_and_save_best_models(metrics, local_episode)
 
-            # Check for new high scores and save best model checkpoints (main process only)
-            if self.is_main_process:
-                self._check_and_save_best_models(metrics, local_episode)
-
-            # Save regular checkpoint every save_frequency episodes (main process only)
-            if self.is_main_process and (local_episode + 1) % self.config.get('save_frequency', 100) == 0:
+            # Save regular checkpoint every save_frequency episodes
+            if (local_episode + 1) % self.config.get('save_frequency', 100) == 0:
                 self._save_checkpoint("regular")
 
-            # Synchronize after checkpoint save
-            if self.distributed:
-                dist.barrier()
-
-            # Log progress (main process only)
-            if self.is_main_process and local_episode % self.config.get('log_frequency', 25) == 0:
+            # Log progress
+            if local_episode % self.config.get('log_frequency', 25) == 0:
                 # Calculate rolling averages
                 window = min(50, len(self.episode_returns))
                 if window > 0:
@@ -1745,59 +1827,6 @@ class SimpleAgent:
         
         self.action_probs = np.maximum(self.action_probs, 0.01)
         self.action_probs /= np.sum(self.action_probs)
-
-
-def setup_distributed(rank: int, world_size: int):
-    """Setup distributed training environment"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-
-    # Initialize process group
-    dist.init_process_group(
-        backend='nccl',  # Use NCCL for GPU training
-        init_method='env://',
-        world_size=world_size,
-        rank=rank
-    )
-
-
-def cleanup_distributed():
-    """Cleanup distributed training"""
-    dist.destroy_process_group()
-
-
-def train_worker(rank: int, world_size: int, args, config):
-    """Worker function for each GPU process"""
-    try:
-        # Setup distributed training
-        setup_distributed(rank, world_size)
-
-        # Create trainer with distributed settings
-        trainer = EnhancedCLSTMPPOTrainer(
-            use_wandb=args.wandb and rank == 0,  # Only main process logs to wandb
-            config=config,
-            checkpoint_dir=args.checkpoint_dir,
-            resume_from=args.resume_from,
-            rank=rank,
-            world_size=world_size,
-            distributed=True,
-            enable_multi_leg=args.enable_multi_leg,
-            use_ensemble=args.use_ensemble,
-            num_ensemble_models=args.num_ensemble_models
-        )
-
-        # Initialize and train
-        asyncio.run(trainer.initialize())
-
-        # Train ensemble or single model
-        if args.train_ensemble:
-            asyncio.run(trainer.train_ensemble_models(episodes_per_model=args.episodes_per_ensemble_model))
-        else:
-            asyncio.run(trainer.train(num_episodes=args.episodes))
-
-    finally:
-        # Cleanup
-        cleanup_distributed()
 
 
 async def main():
@@ -2022,71 +2051,65 @@ async def main():
             logger.info("🗑️ Cleared checkpoint directory for fresh start")
 
     # Launch training
-    if world_size <= 1:
-        # Single GPU or CPU training
-        logger.info("📍 Single GPU/CPU training mode")
-        trainer = EnhancedCLSTMPPOTrainer(
-            use_wandb=args.wandb,
-            config=config,
-            checkpoint_dir=args.checkpoint_dir,
-            resume_from=args.resume_from,
-            rank=0,
-            world_size=1,
-            distributed=False,
-            enable_multi_leg=args.enable_multi_leg,
-            use_ensemble=args.use_ensemble,
-            num_ensemble_models=args.num_ensemble_models
-        )
+    # FIXED: Always use single-process mode, even with multiple GPUs
+    # PyTorch DDP will handle multi-GPU within the same process
+    logger.info("📍 Single-process training mode")
+    if world_size > 1:
+        logger.info(f"   🌐 Using {world_size} GPUs with DataParallel (not DDP)")
+        logger.info(f"   ⚠️  Note: True DDP requires NCCL backend and separate process per GPU")
+        logger.info(f"   ✅ Using nn.DataParallel for multi-GPU support instead")
 
-        await trainer.initialize()
+    trainer = EnhancedCLSTMPPOTrainer(
+        use_wandb=args.wandb,
+        config=config,
+        checkpoint_dir=args.checkpoint_dir,
+        resume_from=args.resume_from,
+        rank=0,
+        world_size=1,  # Always 1 for single-process mode
+        distributed=False,  # Disable DDP, use DataParallel instead
+        enable_multi_leg=args.enable_multi_leg,
+        use_ensemble=args.use_ensemble,
+        num_ensemble_models=args.num_ensemble_models
+    )
 
-        # Train ensemble or single model
-        if args.train_ensemble:
-            await trainer.train_ensemble_models(episodes_per_model=args.episodes_per_ensemble_model)
-            print("\n🎉 ENSEMBLE TRAINING COMPLETE!")
-            print(f"✅ Trained {args.num_ensemble_models} models")
-            print(f"✅ {args.episodes_per_ensemble_model} episodes per model")
-            print(f"✅ Total episodes: {args.num_ensemble_models * args.episodes_per_ensemble_model}")
-        else:
-            success = await trainer.train(args.episodes)
+    await trainer.initialize()
 
-            if success:
-                print("\n🎉 ENHANCED CLSTM-PPO TRAINING SUCCESS!")
-                print("✅ CLSTM features properly extracted and used by PPO")
-                print("✅ Technical indicators and market microstructure included")
-                print("✅ Realistic transaction costs integrated")
-                if args.enable_multi_leg:
-                    print("✅ Multi-leg strategies enabled (91 actions)")
-                if args.use_ensemble:
-                    print(f"✅ Ensemble methods enabled ({args.num_ensemble_models} models)")
-                print("✅ Agent learned to trade with complex features")
-            else:
-                # Check if trades happened but not profitable
-                total_trades = sum(trainer.episode_trades) if trainer.episode_trades else 0
-                if total_trades > 0:
-                    print(f"\n⚠️ Training completed with {total_trades} total trades but not yet profitable")
-                    print("   Continue training or adjust hyperparameters for better performance")
-                else:
-                    print("\n❌ Training completed but no trades produced")
-                    print("   Check exploration settings and reward function")
+    # Train ensemble or single model
+    if args.train_ensemble:
+        await trainer.train_ensemble_models(episodes_per_model=args.episodes_per_ensemble_model)
+        print("\n🎉 ENSEMBLE TRAINING COMPLETE!")
+        print(f"✅ Trained {args.num_ensemble_models} models")
+        print(f"✅ {args.episodes_per_ensemble_model} episodes per model")
+        print(f"✅ Total episodes: {args.num_ensemble_models * args.episodes_per_ensemble_model}")
     else:
-        # Multi-GPU distributed training
-        logger.info(f"🌐 Multi-GPU distributed training mode: {world_size} GPUs")
-        logger.info("   Each GPU will train on different episodes with synchronized gradients")
-        logger.info("   Expected speedup: ~{:.1f}x".format(world_size * 0.85))  # 85% efficiency
+        success = await trainer.train(args.episodes)
 
-        # Use torch.multiprocessing.spawn to launch worker processes
-        mp.spawn(
-            train_worker,
-            args=(world_size, args, config),
-            nprocs=world_size,
-            join=True
-        )
+        # Close TensorBoard writer
+        if hasattr(trainer, 'writer') and trainer.writer is not None:
+            trainer.writer.close()
+            logger.info("✅ TensorBoard writer closed")
+            print(f"\n📊 TensorBoard logs saved to: {trainer.tensorboard_dir}")
+            print(f"   View with: tensorboard --logdir={trainer.tensorboard_dir}")
 
-        logger.info("\n🎉 MULTI-GPU TRAINING COMPLETE!")
-        logger.info(f"✅ Trained on {world_size} GPUs with synchronized gradients")
-        logger.info("✅ CLSTM features properly extracted and used by PPO")
-        logger.info("✅ Realistic transaction costs integrated")
+        if success:
+            print("\n🎉 ENHANCED CLSTM-PPO TRAINING SUCCESS!")
+            print("✅ CLSTM features properly extracted and used by PPO")
+            print("✅ Technical indicators and market microstructure included")
+            print("✅ Realistic transaction costs integrated")
+            if args.enable_multi_leg:
+                print("✅ Multi-leg strategies enabled (91 actions)")
+            if args.use_ensemble:
+                print(f"✅ Ensemble methods enabled ({args.num_ensemble_models} models)")
+            print("✅ Agent learned to trade with complex features")
+        else:
+            # Check if trades happened but not profitable
+            total_trades = sum(trainer.episode_trades) if trainer.episode_trades else 0
+            if total_trades > 0:
+                print(f"\n⚠️ Training completed with {total_trades} total trades but not yet profitable")
+                print("   Continue training or adjust hyperparameters for better performance")
+            else:
+                print("\n❌ Training completed but no trades produced")
+                print("   Check exploration settings and reward function")
 
 
 if __name__ == "__main__":

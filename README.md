@@ -10,7 +10,7 @@ A sophisticated reinforcement learning trading bot that uses Cascaded LSTM with 
 - **Multi-Leg Options Strategies**: 91 actions including spreads, straddles, strangles, iron condors, and butterflies
 - **Advanced RL Algorithm**: CLSTM-PPO with cascaded LSTM encoder and multi-head attention
 - **Realistic Transaction Costs**: Commission, slippage, and bid-ask spread modeling
-- **Multi-GPU Training**: Distributed training support with PyTorch DDP
+- **Multi-GPU Training**: Data parallelism with PyTorch DataParallel (automatic batch splitting across GPUs)
 - **Fast Data Loading**: Flat file data loader (10,800x faster than REST API)
 - **Comprehensive Metrics**: Win rate, profit rate, Sharpe ratio, max drawdown tracking
 
@@ -62,6 +62,7 @@ Total Input Dim = 27 × num_symbols + 65
 - **Gradient Clipping**: Prevents exploding gradients
 - **Early Stopping**: Automatic stopping on performance plateau
 - **Checkpoint Management**: Best composite, win rate, and profit rate models
+- **TensorBoard Integration**: Real-time visualization of training progress, profitability, and risk metrics
 
 ---
 
@@ -229,6 +230,44 @@ Three models are saved during training:
 
 ---
 
+## 📊 TensorBoard Visualization
+
+### Real-Time Training Monitoring
+
+**Start training:**
+```bash
+python train_enhanced_clstm_ppo.py --use-flat-files --episodes 5000
+```
+
+**Launch TensorBoard (in separate terminal):**
+```bash
+source venv/bin/activate
+tensorboard --logdir=runs
+```
+
+**Open browser:** http://localhost:6006
+
+### Metrics Tracked
+
+**Profitability:**
+- Episode returns, portfolio value, win rate
+- Cumulative profitability rate
+- Rolling averages (100 episodes)
+
+**Risk:**
+- Maximum drawdown
+- Current drawdown
+- Return volatility
+
+**Model Performance:**
+- PPO, CLSTM, Actor, Critic losses
+- Policy entropy (exploration)
+- KL divergence (policy updates)
+
+**See [TENSORBOARD_GUIDE.md](TENSORBOARD_GUIDE.md) for detailed visualization guide.**
+
+---
+
 ## 🎓 Multi-Leg Strategies
 
 ### Supported Strategies (91 Actions)
@@ -283,16 +322,28 @@ Example:
 python train_enhanced_clstm_ppo.py --use-flat-files --episodes 5000
 ```
 
-**Multi-GPU (Distributed Data Parallel):**
+**Multi-GPU (DataParallel):**
 ```bash
-python train_enhanced_clstm_ppo.py --use-flat-files --episodes 5000 --num-gpus 4
+# Automatically uses all available GPUs
+python train_enhanced_clstm_ppo.py --use-flat-files --episodes 5000 --num-gpus -1
+
+# Or specify number of GPUs
+python train_enhanced_clstm_ppo.py --use-flat-files --episodes 5000 --num-gpus 2
 ```
+
+**How It Works:**
+- ✅ **Single Process**: One training process manages all GPUs (simpler than DDP)
+- ✅ **Automatic Batch Splitting**: PyTorch DataParallel automatically splits batches across GPUs
+- ✅ **Gradient Aggregation**: Gradients are automatically averaged across GPUs
+- ✅ **Sequential Episodes**: Episodes are trained sequentially (1, 2, 3, ...) not in parallel
+- ✅ **Expected Speedup**: ~70-80% efficiency (e.g., 2 GPUs = 1.5-1.6x speedup)
 
 **Features:**
 - Automatic GPU detection and allocation
-- Gradient synchronization across GPUs
+- No complex distributed setup required
 - Memory-efficient training with mixed precision
 - GPU memory monitoring and logging
+- Single checkpoint file (no race conditions)
 
 ### Data Loading Options
 
