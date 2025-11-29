@@ -1,0 +1,103 @@
+# H200 GPU Optimized Training Configuration
+# Hardware: 1x NVIDIA H200 (141GB VRAM), 24 vCPUs, 240GB RAM, NVMe SSD
+# Target: Maximum throughput while maintaining training stability
+
+# ============================================================================
+# HARDWARE OPTIMIZATION SETTINGS
+# ============================================================================
+
+# GPU Settings - Maximize H200 utilization
+mixed_precision: true              # Use BF16/FP16 for 2x speedup
+compile_model: true                # torch.compile for kernel fusion
+compile_mode: 'max-autotune'       # Maximum optimization (slower compile, faster run)
+cudnn_benchmark: true              # Optimize cuDNN kernels for fixed input sizes
+
+# Parallelization - Utilize 24 vCPUs
+n_envs: 20                         # Parallel environments (leave 4 CPUs for overhead)
+num_workers: 8                     # Data loader workers
+pin_memory: true                   # Pin memory for faster GPU transfers
+prefetch_factor: 4                 # Prefetch batches
+
+# ============================================================================
+# BATCH SIZES - Maximize GPU memory utilization (141GB VRAM)
+# ============================================================================
+batch_size: 8192                   # Large batch for H200 (141GB can handle this easily)
+mini_batch_size: 2048              # Mini-batch for PPO updates
+n_steps: 512                       # Steps per rollout per environment
+buffer_size: 10240                 # n_envs * n_steps = 20 * 512 = 10,240
+
+# ============================================================================
+# LEARNING RATES - Scaled for large batch
+# ============================================================================
+learning_rate_actor_critic: 3.0e-4  # Slightly higher for large batch
+learning_rate_clstm: 5.0e-4         # Feature extractor LR
+learning_rate_warmup: 1000          # Warmup steps
+learning_rate_schedule: 'cosine'    # Cosine annealing
+min_learning_rate: 1.0e-5           # Minimum LR floor
+
+# ============================================================================
+# PPO HYPERPARAMETERS - Tuned for large batch training
+# ============================================================================
+gamma: 0.99                         # Discount factor
+gae_lambda: 0.95                    # GAE parameter
+clip_epsilon: 0.2                   # PPO clip
+value_coef: 0.5                     # Value loss weight
+n_epochs: 10                        # PPO epochs per update
+
+# ============================================================================
+# EXPLORATION - Encourage action diversity
+# ============================================================================
+entropy_coef: 0.05                  # Entropy bonus
+entropy_decay: 0.998                # Slow decay
+min_entropy_coef: 0.01              # Minimum entropy
+
+# ============================================================================
+# REGULARIZATION & STABILITY
+# ============================================================================
+max_grad_norm: 0.5                  # Gradient clipping
+normalize_advantages: true          # Normalize advantages
+normalize_rewards: true             # Running reward normalization
+reward_clip: 10.0                   # Clip rewards
+l2_reg: 1.0e-5                      # Light L2 regularization
+
+# ============================================================================
+# TRAINING DURATION
+# ============================================================================
+total_timesteps: 10_000_000         # 10M timesteps
+num_episodes: 5000                  # Approximate episodes
+
+# ============================================================================
+# CHECKPOINTING & LOGGING
+# ============================================================================
+save_frequency: 100                 # Save every 100 iterations
+log_frequency: 10                   # Log every 10 iterations
+tensorboard_log: true               # Enable TensorBoard
+eval_frequency: 50                  # Evaluate every 50 iterations
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+data_dir: 'data/flat_files_processed'
+cache_data_in_memory: true          # Load all data to RAM (240GB available)
+
+# ============================================================================
+# ENVIRONMENT SETTINGS
+# ============================================================================
+initial_capital: 100000
+max_positions: 5
+episode_length: 256                 # Longer episodes for more context
+use_realistic_costs: true
+enable_slippage: true
+
+# ============================================================================
+# EXPECTED PERFORMANCE
+# ============================================================================
+# With these settings on H200:
+# - ~15,000-25,000 steps/second (vs ~100 sequential)
+# - ~10M timesteps in ~7-15 minutes
+# - Full utilization of GPU compute and memory
+

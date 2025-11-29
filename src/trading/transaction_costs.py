@@ -62,8 +62,8 @@ class RealisticTransactionCostCalculator:
         self,
         enable_slippage: bool = True,
         slippage_model: str = 'volume_based',  # 'volume_based', 'fixed', 'none'
-        min_spread_pct: float = 0.02,  # 2% minimum spread
-        max_spread_pct: float = 0.10,  # 10% maximum spread
+        min_spread_pct: float = 0.005,  # 0.5% minimum spread (REDUCED from 2%)
+        max_spread_pct: float = 0.03,  # 3% maximum spread (REDUCED from 10%)
         log_costs: bool = True
     ):
         self.enable_slippage = enable_slippage
@@ -180,34 +180,34 @@ class RealisticTransactionCostCalculator:
     def _estimate_spread_pct(self, option_data: Dict) -> float:
         """
         Estimate bid-ask spread percentage based on option characteristics
-        
+
         Spread is wider for:
         - Far OTM/ITM options (low moneyness)
         - Low volume options
         - High volatility options
         - Options close to expiration
         """
-        # Base spread
-        spread_pct = 0.03  # 3% default
+        # Base spread (REDUCED from 3% to 0.8%)
+        spread_pct = 0.008  # 0.8% default
         
-        # Adjust for moneyness (if available)
+        # Adjust for moneyness (if available) - REDUCED adjustments
         moneyness = option_data.get('moneyness', 1.0)
         if moneyness != 1.0:
             # Wider spread for OTM/ITM options
             moneyness_factor = abs(1.0 - moneyness)
-            spread_pct += moneyness_factor * 0.05  # Up to +5% for deep OTM/ITM
-        
-        # Adjust for volume (if available)
+            spread_pct += moneyness_factor * 0.01  # Up to +1% for deep OTM/ITM (was 5%)
+
+        # Adjust for volume (if available) - REDUCED adjustments
         volume = option_data.get('volume', 100)
         if volume < 10:
-            spread_pct += 0.03  # +3% for very low volume
+            spread_pct += 0.005  # +0.5% for very low volume (was 3%)
         elif volume < 50:
-            spread_pct += 0.01  # +1% for low volume
-        
-        # Adjust for implied volatility (if available)
+            spread_pct += 0.002  # +0.2% for low volume (was 1%)
+
+        # Adjust for implied volatility (if available) - REDUCED adjustments
         iv = option_data.get('implied_volatility', 0.3)
         if iv > 0.5:  # High IV
-            spread_pct += 0.02  # +2% for high volatility
+            spread_pct += 0.005  # +0.5% for high volatility (was 2%)
         
         # Clamp to min/max
         spread_pct = max(self.min_spread_pct, min(self.max_spread_pct, spread_pct))

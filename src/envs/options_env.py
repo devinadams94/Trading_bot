@@ -19,9 +19,9 @@ except ImportError:
     import gym
     from gym import spaces
 
-# Import paper optimizations
+# Import from new module structure
 try:
-    from .paper_optimizations import TechnicalIndicators
+    from src.utils.indicators import TechnicalIndicators
 except ImportError:
     # Fallback if import fails
     class TechnicalIndicators:
@@ -43,11 +43,19 @@ logger = logging.getLogger(__name__)
 
 # Import realistic transaction costs
 try:
-    from .realistic_transaction_costs import RealisticTransactionCostCalculator
+    from src.trading.transaction_costs import RealisticTransactionCostCalculator
 except ImportError:
     # Fallback if import fails
     RealisticTransactionCostCalculator = None
     logger.warning("⚠️ Realistic transaction costs not available, using legacy commission model")
+
+# Import unified Greeks calculator
+try:
+    from src.utils.greeks import GreeksCalculator, get_greeks_calculator
+    GREEKS_CALCULATOR = get_greeks_calculator(risk_free_rate=0.05)
+except ImportError:
+    GREEKS_CALCULATOR = None
+    logger.warning("⚠️ Greeks calculator not available, using fallback values")
 
 
 class WorkingOptionsEnvironment(gym.Env):
@@ -76,11 +84,16 @@ class WorkingOptionsEnvironment(gym.Env):
         use_realistic_costs: bool = True,
         enable_slippage: bool = True,
         slippage_model: str = 'volume_based',
+        # Position sizing parameters
+        position_size_pct: float = 0.02,  # Risk 2% of portfolio per trade
+        max_contracts_per_trade: int = 10,  # Cap at 10 contracts max
         **kwargs
     ):
         super().__init__()
 
         self.data_loader = data_loader
+        self.position_size_pct = position_size_pct
+        self.max_contracts_per_trade = max_contracts_per_trade
         # Enhanced symbol list with major tech stocks
         self.symbols = symbols or [
             'SPY', 'QQQ', 'IWM',  # ETFs
@@ -215,21 +228,32 @@ class WorkingOptionsEnvironment(gym.Env):
         self.data_loaded = True
         logger.info(f"Data loaded for {len(self.market_data)} symbols")
     
-    def _find_option_contract(self, symbol: str, strike: float, option_type: str, tolerance: float = 0.5) -> Optional[Dict]:
+    def _find_option_contract(self, symbol: str, strike: float, option_type: str, timestamp: datetime = None, tolerance: float = 2.0) -> Optional[Dict]:
         """
-        Find matching option contract from loaded options data (OPTIMIZED with caching)
+        Find matching option contract from loaded options data at a specific timestamp
 
         Args:
             symbol: Underlying symbol
             strike: Strike price
             option_type: 'call' or 'put'
-            tolerance: Strike price tolerance (default: $0.50)
+            timestamp: Timestamp to find option price at (matches by DATE, not exact time)
+            tolerance: Strike price tolerance (default: $2.00 to handle strike rounding)
 
         Returns:
             Option contract dict with Greeks, or None if not found
         """
-        # OPTIMIZATION: Check cache first
-        cache_key = (symbol, round(strike, 2), option_type.lower())
+        # Timestamp is required for accurate pricing
+        if timestamp is None:
+            return None
+
+        # Extract date for matching (options data has intraday timestamps)
+        if hasattr(timestamp, 'date'):
+            target_date = timestamp.date()
+        else:
+            target_date = pd.Timestamp(timestamp).date()
+
+        # OPTIMIZATION: Check cache first (use date, not full timestamp)
+        cache_key = (symbol, round(strike, 0), option_type.lower(), target_date)
         if cache_key in self._greeks_cache:
             self._cache_hits += 1
             return self._greeks_cache[cache_key]
@@ -240,12 +264,27 @@ class WorkingOptionsEnvironment(gym.Env):
             self._greeks_cache[cache_key] = None
             return None
 
-        # Find options with matching strike and type
-        matching_options = [
-            opt for opt in self.options_data[symbol]
-            if abs(opt.get('strike', 0) - strike) <= tolerance
-            and opt.get('option_type', '').lower() == option_type.lower()
-        ]
+        # Find options with matching strike, type, AND date
+        matching_options = []
+        for opt in self.options_data[symbol]:
+            opt_strike = opt.get('strike', 0)
+            opt_type = opt.get('option_type', '').lower()
+            opt_ts = opt.get('timestamp')
+
+            # Check strike and type
+            if abs(opt_strike - strike) > tolerance:
+                continue
+            if opt_type != option_type.lower():
+                continue
+
+            # Check date match
+            if opt_ts is not None:
+                if hasattr(opt_ts, 'date'):
+                    opt_date = opt_ts.date()
+                else:
+                    opt_date = pd.Timestamp(opt_ts).date()
+                if opt_date == target_date:
+                    matching_options.append(opt)
 
         if not matching_options:
             self._greeks_cache[cache_key] = None
@@ -255,6 +294,82 @@ class WorkingOptionsEnvironment(gym.Env):
         result = min(matching_options, key=lambda x: abs(x.get('strike', 0) - strike))
         self._greeks_cache[cache_key] = result
         return result
+
+    def _calculate_greeks(
+        self,
+        underlying_price: float,
+        strike: float,
+        option_type: str,
+        time_to_expiry_days: float = 30,
+        iv: float = 0.30,
+        option_price: float = None
+    ) -> Dict[str, float]:
+        """
+        Calculate Greeks using unified calculator.
+
+        This ensures consistency with historical data processing.
+
+        Args:
+            underlying_price: Current underlying price
+            strike: Strike price
+            option_type: 'call' or 'put'
+            time_to_expiry_days: Days to expiration
+            iv: Implied volatility (if known)
+            option_price: Option mid price (used to calculate IV if iv not provided)
+
+        Returns:
+            Dict with delta, gamma, theta, vega
+        """
+        if GREEKS_CALCULATOR is None:
+            # Fallback: approximate Greeks based on moneyness
+            moneyness = underlying_price / strike
+            is_call = option_type.lower() == 'call'
+
+            if is_call:
+                if moneyness > 1.05:  # ITM
+                    delta = 0.7 + 0.2 * min(1, (moneyness - 1) * 5)
+                elif moneyness < 0.95:  # OTM
+                    delta = 0.3 - 0.2 * min(1, (1 - moneyness) * 5)
+                else:  # ATM
+                    delta = 0.5
+            else:
+                if moneyness > 1.05:  # OTM put
+                    delta = -0.3 + 0.2 * min(1, (moneyness - 1) * 5)
+                elif moneyness < 0.95:  # ITM put
+                    delta = -0.7 - 0.2 * min(1, (1 - moneyness) * 5)
+                else:  # ATM
+                    delta = -0.5
+
+            # Rough estimates for other Greeks
+            gamma = 0.05 * (1 - abs(1 - moneyness) * 2)  # Highest ATM
+            theta = -iv * underlying_price * 0.01 / max(time_to_expiry_days, 1)
+            vega = underlying_price * 0.01 * np.sqrt(time_to_expiry_days / 252)
+
+            return {'delta': delta, 'gamma': max(0, gamma), 'theta': theta, 'vega': vega}
+
+        # Use unified calculator
+        time_to_expiry = time_to_expiry_days / 252  # Convert to years
+
+        if option_price is not None and iv <= 0:
+            # Calculate from price
+            result = GREEKS_CALCULATOR.calculate_greeks_from_price(
+                option_price=option_price,
+                underlying_price=underlying_price,
+                strike=strike,
+                time_to_expiry=time_to_expiry,
+                option_type=option_type
+            )
+        else:
+            # Calculate from IV
+            result = GREEKS_CALCULATOR.calculate_greeks(
+                underlying_price=underlying_price,
+                strike=strike,
+                time_to_expiry=time_to_expiry,
+                iv=iv,
+                option_type=option_type
+            )
+
+        return result.to_dict()
 
     def _create_synthetic_data(self, start_date: datetime, end_date: datetime):
         """Create synthetic market data"""
@@ -292,8 +407,17 @@ class WorkingOptionsEnvironment(gym.Env):
         self.current_step = 0
         self.episode_trades = 0
         self.trade_history = []
-        self.current_data_index = 0
-        self.current_symbol = self.symbols[0] if self.symbols else 'SPY'
+
+        # Randomize starting point for diverse training
+        # Leave room for episode_length steps
+        if self.data_loaded and self.symbols:
+            self.current_symbol = np.random.choice(self.symbols)
+            data_len = len(self.market_data.get(self.current_symbol, []))
+            max_start = max(0, data_len - self.episode_length - 1)
+            self.current_data_index = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+        else:
+            self.current_symbol = self.symbols[0] if self.symbols else 'SPY'
+            self.current_data_index = 0
 
         # Portfolio tracking
         self.portfolio_value_history = [self.initial_capital]
@@ -314,6 +438,36 @@ class WorkingOptionsEnvironment(gym.Env):
             self._reset_count = 0
 
         return self._get_observation()
+
+    def _calculate_position_size(self, option_price: float, portfolio_value: float) -> int:
+        """
+        Calculate number of contracts to trade based on position sizing rules
+
+        Args:
+            option_price: Price per contract (will be multiplied by 100 for shares)
+            portfolio_value: Current total portfolio value
+
+        Returns:
+            Number of contracts to trade (minimum 1, maximum max_contracts_per_trade)
+        """
+        # Calculate risk amount (e.g., 2% of portfolio)
+        risk_amount = portfolio_value * self.position_size_pct
+
+        # Calculate how many contracts this allows
+        # Each contract costs: option_price * 100 shares
+        contract_cost = option_price * 100
+
+        if contract_cost <= 0:
+            return 1  # Minimum 1 contract
+
+        # Number of contracts we can afford with our risk budget
+        num_contracts = int(risk_amount / contract_cost)
+
+        # Apply constraints
+        num_contracts = max(1, num_contracts)  # Minimum 1 contract
+        num_contracts = min(num_contracts, self.max_contracts_per_trade)  # Cap at max
+
+        return num_contracts
 
     def _calculate_transaction_cost(self, option_data: Dict, quantity: int, side: str = 'buy') -> Tuple[float, Dict]:
         """
@@ -370,24 +524,91 @@ class WorkingOptionsEnvironment(gym.Env):
             current_price = current_data['close']
             strike_price = current_price * (1 + strike_offset)
 
-            # Simple option pricing (mid-price estimate)
-            option_price_mid = max(0.5, current_price * 0.05 * (1 - strike_offset))
+            # Get current timestamp for option lookup
+            current_timestamp = current_data.get('timestamp')
 
-            # Create option data for transaction cost calculation
-            moneyness = strike_price / current_price
-            spread_pct = 0.02 + 0.03 * abs(1 - moneyness)  # 2-5% spread
-            option_data = {
-                'bid': option_price_mid * (1 - spread_pct / 2),
-                'ask': option_price_mid * (1 + spread_pct / 2),
-                'last': option_price_mid,
-                'volume': current_data.get('volume', 1000) / 100,  # Estimate options volume
-                'open_interest': 1000,
-                'moneyness': moneyness,
-                'implied_volatility': current_data.get('volatility', 0.3)
-            }
+            # Try to find real option contract with Greeks FIRST
+            option_contract = self._find_option_contract(
+                self.current_symbol, strike_price, 'call', timestamp=current_timestamp
+            )
+
+            # Use real option data if available, otherwise fall back to synthetic
+            if option_contract:
+                option_price_mid = (option_contract.get('bid', 0) + option_contract.get('ask', 0)) / 2
+                if option_price_mid <= 0:
+                    option_price_mid = option_contract.get('last', 0)
+                option_data = {
+                    'bid': option_contract.get('bid', option_price_mid * 0.98),
+                    'ask': option_contract.get('ask', option_price_mid * 1.02),
+                    'last': option_contract.get('last', option_price_mid),
+                    'volume': option_contract.get('volume', 100),
+                    'open_interest': option_contract.get('open_interest', 1000),
+                    'moneyness': strike_price / current_price,
+                    'implied_volatility': option_contract.get('implied_volatility', 0.3)
+                }
+                # Use Greeks from data, or recalculate if missing/zero
+                iv = option_contract.get('implied_volatility', 0.3)
+                stored_delta = option_contract.get('delta', 0)
+
+                if abs(stored_delta) > 0.001:
+                    # Use stored Greeks
+                    delta = stored_delta
+                    gamma = option_contract.get('gamma', 0.05)
+                    theta = option_contract.get('theta', -0.5)
+                    vega = option_contract.get('vega', 0.02)
+                else:
+                    # Recalculate using unified calculator
+                    greeks = self._calculate_greeks(
+                        underlying_price=current_price,
+                        strike=strike_price,
+                        option_type='call',
+                        time_to_expiry_days=30,  # Assume 30 DTE
+                        iv=iv,
+                        option_price=option_price_mid
+                    )
+                    delta = greeks['delta']
+                    gamma = greeks['gamma']
+                    theta = greeks['theta']
+                    vega = greeks['vega']
+            else:
+                # Fallback: synthetic pricing with calculated Greeks
+                moneyness = strike_price / current_price
+                spread_pct = 0.02 + 0.03 * abs(1 - moneyness)
+                option_price_mid = max(0.5, current_price * 0.05 * (1 - strike_offset))
+                iv = current_data.get('volatility', 0.3)
+
+                option_data = {
+                    'bid': option_price_mid * (1 - spread_pct / 2),
+                    'ask': option_price_mid * (1 + spread_pct / 2),
+                    'last': option_price_mid,
+                    'volume': current_data.get('volume', 1000) / 100,
+                    'open_interest': 1000,
+                    'moneyness': moneyness,
+                    'implied_volatility': iv
+                }
+
+                # Calculate Greeks using unified calculator
+                greeks = self._calculate_greeks(
+                    underlying_price=current_price,
+                    strike=strike_price,
+                    option_type='call',
+                    time_to_expiry_days=30,
+                    iv=iv,
+                    option_price=option_price_mid
+                )
+                delta = greeks['delta']
+                gamma = greeks['gamma']
+                theta = greeks['theta']
+                vega = greeks['vega']
+
+            # Calculate position size based on portfolio value
+            portfolio_value = self.capital + sum(
+                p.get('entry_price', 0) * p.get('quantity', 0) * 100
+                for p in self.positions
+            )
+            quantity = self._calculate_position_size(option_price_mid, portfolio_value)
 
             # Calculate transaction cost
-            quantity = 1  # 1 contract = 100 shares
             transaction_cost, cost_breakdown = self._calculate_transaction_cost(
                 option_data, quantity, side='buy'
             )
@@ -398,8 +619,8 @@ class WorkingOptionsEnvironment(gym.Env):
             else:
                 execution_price = option_price_mid
 
-            # Total cost including transaction costs
-            total_cost = execution_price * 100 + transaction_cost
+            # Total cost including transaction costs (quantity * price * 100 shares)
+            total_cost = execution_price * 100 * quantity + transaction_cost
 
             if self.capital >= total_cost:
                 # Execute trade
@@ -407,29 +628,11 @@ class WorkingOptionsEnvironment(gym.Env):
                 step_transaction_costs += transaction_cost
                 transaction_cost_breakdown = cost_breakdown
 
-                # Try to find real option contract with Greeks
-                option_contract = self._find_option_contract(
-                    self.current_symbol, strike_price, 'call'
-                )
-
-                # Extract Greeks from real contract or use defaults
-                if option_contract:
-                    delta = option_contract.get('delta', 0.0)
-                    gamma = option_contract.get('gamma', 0.0)
-                    theta = option_contract.get('theta', 0.0)
-                    vega = option_contract.get('vega', 0.0)
-                else:
-                    # Default Greeks for calls (approximate)
-                    delta = 0.5  # ATM call delta
-                    gamma = 0.05
-                    theta = -0.5
-                    vega = 0.02
-
                 position = {
                     'type': 'call',
                     'strike': strike_price,
                     'entry_price': execution_price,
-                    'quantity': 100,
+                    'quantity': quantity,  # FIX: Use calculated quantity, not hardcoded 100
                     'symbol': self.current_symbol,
                     'entry_step': self.current_step,
                     'cost': total_cost,
@@ -444,7 +647,7 @@ class WorkingOptionsEnvironment(gym.Env):
 
                 action_name = f"BUY_CALL_{strike_price:.0f}"
 
-                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}, delta={delta:.3f}")
+                logger.debug(f"Executed: {action_name}, qty={quantity}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}, delta={delta:.3f}")
 
         elif 11 <= action <= 20:
             # Buy put options
@@ -455,24 +658,91 @@ class WorkingOptionsEnvironment(gym.Env):
             current_price = current_data['close']
             strike_price = current_price * (1 - strike_offset)
 
-            # Simple option pricing (mid-price estimate)
-            option_price_mid = max(0.5, current_price * 0.05 * (1 - strike_offset))
+            # Get current timestamp for option lookup
+            current_timestamp = current_data.get('timestamp')
 
-            # Create option data for transaction cost calculation
-            moneyness = strike_price / current_price
-            spread_pct = 0.02 + 0.03 * abs(1 - moneyness)  # 2-5% spread
-            option_data = {
-                'bid': option_price_mid * (1 - spread_pct / 2),
-                'ask': option_price_mid * (1 + spread_pct / 2),
-                'last': option_price_mid,
-                'volume': current_data.get('volume', 1000) / 100,
-                'open_interest': 1000,
-                'moneyness': moneyness,
-                'implied_volatility': current_data.get('volatility', 0.3)
-            }
+            # Try to find real option contract with Greeks FIRST
+            option_contract = self._find_option_contract(
+                self.current_symbol, strike_price, 'put', timestamp=current_timestamp
+            )
+
+            # Use real option data if available, otherwise fall back to synthetic
+            if option_contract:
+                option_price_mid = (option_contract.get('bid', 0) + option_contract.get('ask', 0)) / 2
+                if option_price_mid <= 0:
+                    option_price_mid = option_contract.get('last', 0)
+                option_data = {
+                    'bid': option_contract.get('bid', option_price_mid * 0.98),
+                    'ask': option_contract.get('ask', option_price_mid * 1.02),
+                    'last': option_contract.get('last', option_price_mid),
+                    'volume': option_contract.get('volume', 100),
+                    'open_interest': option_contract.get('open_interest', 1000),
+                    'moneyness': strike_price / current_price,
+                    'implied_volatility': option_contract.get('implied_volatility', 0.3)
+                }
+                # Use Greeks from data, or recalculate if missing/zero
+                iv = option_contract.get('implied_volatility', 0.3)
+                stored_delta = option_contract.get('delta', 0)
+
+                if abs(stored_delta) > 0.001:
+                    # Use stored Greeks
+                    delta = stored_delta
+                    gamma = option_contract.get('gamma', 0.05)
+                    theta = option_contract.get('theta', -0.5)
+                    vega = option_contract.get('vega', 0.02)
+                else:
+                    # Recalculate using unified calculator
+                    greeks = self._calculate_greeks(
+                        underlying_price=current_price,
+                        strike=strike_price,
+                        option_type='put',
+                        time_to_expiry_days=30,
+                        iv=iv,
+                        option_price=option_price_mid
+                    )
+                    delta = greeks['delta']
+                    gamma = greeks['gamma']
+                    theta = greeks['theta']
+                    vega = greeks['vega']
+            else:
+                # Fallback: synthetic pricing with calculated Greeks
+                moneyness = strike_price / current_price
+                spread_pct = 0.02 + 0.03 * abs(1 - moneyness)
+                option_price_mid = max(0.5, current_price * 0.05 * (1 - strike_offset))
+                iv = current_data.get('volatility', 0.3)
+
+                option_data = {
+                    'bid': option_price_mid * (1 - spread_pct / 2),
+                    'ask': option_price_mid * (1 + spread_pct / 2),
+                    'last': option_price_mid,
+                    'volume': current_data.get('volume', 1000) / 100,
+                    'open_interest': 1000,
+                    'moneyness': moneyness,
+                    'implied_volatility': iv
+                }
+
+                # Calculate Greeks using unified calculator
+                greeks = self._calculate_greeks(
+                    underlying_price=current_price,
+                    strike=strike_price,
+                    option_type='put',
+                    time_to_expiry_days=30,
+                    iv=iv,
+                    option_price=option_price_mid
+                )
+                delta = greeks['delta']
+                gamma = greeks['gamma']
+                theta = greeks['theta']
+                vega = greeks['vega']
+
+            # Calculate position size based on portfolio value
+            portfolio_value = self.capital + sum(
+                p.get('entry_price', 0) * p.get('quantity', 0) * 100
+                for p in self.positions
+            )
+            quantity = self._calculate_position_size(option_price_mid, portfolio_value)
 
             # Calculate transaction cost
-            quantity = 1  # 1 contract
             transaction_cost, cost_breakdown = self._calculate_transaction_cost(
                 option_data, quantity, side='buy'
             )
@@ -483,8 +753,8 @@ class WorkingOptionsEnvironment(gym.Env):
             else:
                 execution_price = option_price_mid
 
-            # Total cost including transaction costs
-            total_cost = execution_price * 100 + transaction_cost
+            # Total cost including transaction costs (quantity * price * 100 shares)
+            total_cost = execution_price * 100 * quantity + transaction_cost
 
             if self.capital >= total_cost:
                 # Execute trade
@@ -492,29 +762,11 @@ class WorkingOptionsEnvironment(gym.Env):
                 step_transaction_costs += transaction_cost
                 transaction_cost_breakdown = cost_breakdown
 
-                # Try to find real option contract with Greeks
-                option_contract = self._find_option_contract(
-                    self.current_symbol, strike_price, 'put'
-                )
-
-                # Extract Greeks from real contract or use defaults
-                if option_contract:
-                    delta = option_contract.get('delta', 0.0)
-                    gamma = option_contract.get('gamma', 0.0)
-                    theta = option_contract.get('theta', 0.0)
-                    vega = option_contract.get('vega', 0.0)
-                else:
-                    # Default Greeks for puts (approximate)
-                    delta = -0.5  # ATM put delta (negative)
-                    gamma = 0.05
-                    theta = -0.5
-                    vega = 0.02
-
                 position = {
                     'type': 'put',
                     'strike': strike_price,
                     'entry_price': execution_price,
-                    'quantity': 100,
+                    'quantity': quantity,  # FIX: Use calculated quantity, not hardcoded 100
                     'symbol': self.current_symbol,
                     'entry_step': self.current_step,
                     'cost': total_cost,
@@ -529,7 +781,7 @@ class WorkingOptionsEnvironment(gym.Env):
 
                 action_name = f"BUY_PUT_{strike_price:.0f}"
 
-                logger.debug(f"Executed: {action_name}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}, delta={delta:.3f}")
+                logger.debug(f"Executed: {action_name}, qty={quantity}, cost=${total_cost:.2f}, txn_cost=${transaction_cost:.2f}, delta={delta:.3f}")
             
         elif 21 <= action <= 30:
             # Sell positions (or buy if no positions)
@@ -540,53 +792,108 @@ class WorkingOptionsEnvironment(gym.Env):
                 # Sell oldest position
                 position = self.positions.pop(0)
                 current_price = current_data['close']
+                current_timestamp = current_data.get('timestamp')
+                position_type = position['type']
 
-                # Calculate option value at current price (mid-price estimate)
-                if position['type'] == 'call':
-                    intrinsic_value = max(0, current_price - position['strike'])
-                else:  # put
-                    intrinsic_value = max(0, position['strike'] - current_price)
+                # Determine option type for lookup
+                if position_type in ['call', 'covered_call']:
+                    lookup_type = 'call'
+                else:
+                    lookup_type = 'put'
 
-                # Add time value
-                time_value = max(0.1, position['entry_price'] * 0.5)
-                option_value_mid = intrinsic_value + time_value
-
-                # Create option data for transaction cost calculation
-                moneyness = position['strike'] / current_price
-                spread_pct = 0.02 + 0.03 * abs(1 - moneyness)
-                option_data = {
-                    'bid': option_value_mid * (1 - spread_pct / 2),
-                    'ask': option_value_mid * (1 + spread_pct / 2),
-                    'last': option_value_mid,
-                    'volume': current_data.get('volume', 1000) / 100,
-                    'open_interest': 1000,
-                    'moneyness': moneyness,
-                    'implied_volatility': current_data.get('volatility', 0.3)
-                }
-
-                # Calculate transaction cost for selling
-                quantity = 1  # 1 contract
-                transaction_cost, cost_breakdown = self._calculate_transaction_cost(
-                    option_data, quantity, side='sell'
+                # Try to find real option contract for current price
+                option_contract = self._find_option_contract(
+                    position['symbol'], position['strike'], lookup_type, timestamp=current_timestamp
                 )
 
-                # Execution price (sell at bid for realistic costs)
+                if option_contract:
+                    # Use real market data
+                    option_value_mid = (option_contract.get('bid', 0) + option_contract.get('ask', 0)) / 2
+                    if option_value_mid <= 0:
+                        option_value_mid = option_contract.get('last', 0)
+                    option_data = {
+                        'bid': option_contract.get('bid', option_value_mid * 0.98),
+                        'ask': option_contract.get('ask', option_value_mid * 1.02),
+                        'last': option_contract.get('last', option_value_mid),
+                        'volume': option_contract.get('volume', 100),
+                        'open_interest': option_contract.get('open_interest', 1000),
+                        'moneyness': position['strike'] / current_price,
+                        'implied_volatility': option_contract.get('implied_volatility', 0.3)
+                    }
+                else:
+                    # Fallback: synthetic pricing based on intrinsic + time value
+                    if position_type == 'call':
+                        intrinsic_value = max(0, current_price - position['strike'])
+                    elif position_type == 'put':
+                        intrinsic_value = max(0, position['strike'] - current_price)
+                    elif position_type == 'covered_call':
+                        intrinsic_value = max(0, current_price - position['strike'])
+                    elif position_type == 'cash_secured_put':
+                        intrinsic_value = max(0, position['strike'] - current_price)
+                    else:
+                        logger.warning(f"Unknown position type: {position_type}")
+                        intrinsic_value = 0
+
+                    time_value = max(0.1, position['entry_price'] * 0.3)  # Reduced time value decay
+                    option_value_mid = intrinsic_value + time_value
+
+                    moneyness = position['strike'] / current_price
+                    spread_pct = 0.02 + 0.03 * abs(1 - moneyness)
+                    option_data = {
+                        'bid': option_value_mid * (1 - spread_pct / 2),
+                        'ask': option_value_mid * (1 + spread_pct / 2),
+                        'last': option_value_mid,
+                        'volume': current_data.get('volume', 1000) / 100,
+                        'open_interest': 1000,
+                        'moneyness': moneyness,
+                        'implied_volatility': current_data.get('volatility', 0.3)
+                    }
+
+                # Determine if this is a long or short position
+                is_short_position = position_type in ['covered_call', 'cash_secured_put']
+
+                # Use the quantity from the position (not recalculated)
+                quantity = position.get('quantity', 1)
+                side = 'buy' if is_short_position else 'sell'  # Short positions: buy to close
+                transaction_cost, cost_breakdown = self._calculate_transaction_cost(
+                    option_data, quantity, side=side
+                )
+
+                # Execution price
                 if self.use_realistic_costs:
-                    execution_price = option_data['bid']
+                    # Long positions: sell at bid
+                    # Short positions: buy at ask (to close)
+                    execution_price = option_data['ask'] if is_short_position else option_data['bid']
                 else:
                     execution_price = option_value_mid
 
-                # Execute sale (proceeds minus transaction costs)
-                gross_proceeds = execution_price * position['quantity']
-                net_proceeds = gross_proceeds - transaction_cost
-                self.capital += net_proceeds
+                # Execute closing trade
+                if is_short_position:
+                    # Short position: we PAY to buy it back (negative proceeds)
+                    # We originally received premium, now we pay to close
+                    gross_cost = execution_price * position['quantity'] * 100  # Cost to buy back
+                    net_cost = gross_cost + transaction_cost  # Total cost including fees
+                    self.capital -= net_cost  # Deduct cost from capital
+
+                    # P&L = premium received - cost to close
+                    premium_received = position.get('premium_received', 0)
+                    pnl = premium_received - net_cost
+
+                    # Release reserved capital if any
+                    if 'capital_reserved' in position:
+                        self.capital += position['capital_reserved']
+                else:
+                    # Long position: we RECEIVE proceeds from selling
+                    gross_proceeds = execution_price * position['quantity'] * 100
+                    net_proceeds = gross_proceeds - transaction_cost
+                    self.capital += net_proceeds
+
+                    # P&L = proceeds - original cost
+                    position_cost = position.get('cost', position['entry_price'] * position['quantity'] * 100)
+                    pnl = net_proceeds - position_cost
+
                 step_transaction_costs += transaction_cost
                 transaction_cost_breakdown = cost_breakdown
-
-                # Calculate P&L (including transaction costs on both entry and exit)
-                entry_txn_cost = position.get('transaction_cost', 0)
-                total_txn_costs = entry_txn_cost + transaction_cost
-                pnl = net_proceeds - position['cost']
 
                 action_name = f"SELL_{position['type'].upper()}"
 
@@ -597,7 +904,7 @@ class WorkingOptionsEnvironment(gym.Env):
                     'entry_price': position['entry_price'],
                     'exit_price': execution_price,
                     'step': self.current_step,
-                    'transaction_costs': total_txn_costs
+                    'transaction_costs': transaction_cost
                 }
                 self.trade_history.append(trade_record)
 
@@ -698,21 +1005,52 @@ class WorkingOptionsEnvironment(gym.Env):
         return data.iloc[self.current_data_index].to_dict()
     
     def _calculate_portfolio_value(self, current_data: Dict) -> float:
-        """Calculate total portfolio value"""
+        """Calculate total portfolio value using REAL option prices from data at current timestamp"""
         total_value = self.capital
-        
+
+        # Get current timestamp for option price lookup
+        current_timestamp = current_data.get('timestamp')
+
         # Add value of open positions
         current_price = current_data['close']
         for position in self.positions:
-            if position['type'] == 'call':
-                intrinsic_value = max(0, current_price - position['strike'])
-            else:  # put
-                intrinsic_value = max(0, position['strike'] - current_price)
-            
-            time_value = max(0.1, position['entry_price'] * 0.3)
-            option_value = intrinsic_value + time_value
-            total_value += option_value * position['quantity']
-        
+            position_type = position['type']
+            strike = position['strike']
+            symbol = position.get('symbol', self.current_symbol)
+            quantity = position.get('quantity', 1)
+
+            # Try to find real option contract with current market price AT CURRENT TIMESTAMP
+            option_contract = None
+            if position_type in ['call', 'covered_call']:
+                option_contract = self._find_option_contract(symbol, strike, 'call', timestamp=current_timestamp)
+            elif position_type in ['put', 'cash_secured_put']:
+                option_contract = self._find_option_contract(symbol, strike, 'put', timestamp=current_timestamp)
+
+            # Use real option price if available, otherwise fall back to intrinsic value only
+            if option_contract and 'close' in option_contract:
+                option_value = option_contract['close']
+            else:
+                # Fallback: Use only intrinsic value (no fake time value!)
+                if position_type in ['call', 'covered_call']:
+                    option_value = max(0, current_price - strike)
+                else:  # put or cash_secured_put
+                    option_value = max(0, strike - current_price)
+
+            # Handle standard call/put positions (long)
+            if position_type in ['call', 'put']:
+                total_value += option_value * quantity * 100  # 100 shares per contract
+
+            # Handle covered call positions (short call)
+            elif position_type == 'covered_call':
+                # For short calls, we owe the option value (liability)
+                total_value -= option_value * quantity * 100
+
+            # Handle cash-secured put positions (short put)
+            elif position_type == 'cash_secured_put':
+                # For short puts, we owe the option value (liability)
+                total_value -= option_value * quantity * 100
+                # Note: capital_reserved is already deducted from self.capital
+
         return total_value
 
     def _calculate_technical_indicators(self, price_series: np.ndarray) -> Dict[str, float]:

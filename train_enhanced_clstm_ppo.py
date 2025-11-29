@@ -51,26 +51,45 @@ load_dotenv()
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.working_options_env import WorkingOptionsEnvironment
-from src.multi_leg_options_env import MultiLegOptionsEnvironment
-from src.historical_options_data import OptimizedHistoricalOptionsDataLoader
-from src.paper_optimizations import (
-    TurbulenceCalculator,
-    EnhancedRewardFunction,
-    CascadedLSTMFeatureExtractor,
-    TechnicalIndicators,
-    create_paper_optimized_config
-)
-from src.gpu_optimizations import GPUOptimizer
-from src.advanced_optimizations import EnsemblePredictor
+# Import from new module structure
+from src.envs.options_env import WorkingOptionsEnvironment
+from src.envs.multi_leg_env import MultiLegOptionsEnvironment
+from src.data.historical_loader import OptimizedHistoricalOptionsDataLoader
+from src.utils.indicators import TurbulenceCalculator, TechnicalIndicators
+from src.training.rewards import EnhancedRewardFunction
+from src.models.feature_extractor import CascadedLSTMFeatureExtractor
+from src.utils.gpu import GPUOptimizer
+from src.models.ensemble import EnsemblePredictor
 
 # Try to import CLSTM-PPO agent
 try:
-    from src.options_clstm_ppo import OptionsCLSTMPPOAgent
+    from src.models.ppo_agent import OptionsCLSTMPPOAgent
     HAS_CLSTM_PPO = True
 except ImportError:
     HAS_CLSTM_PPO = False
     print("Warning: CLSTM-PPO agent not available")
+
+def create_paper_optimized_config():
+    """Create configuration optimized based on paper findings"""
+    return {
+        'learning_rate': 3e-4,
+        'gamma': 0.99,
+        'clip_epsilon': 0.2,
+        'entropy_coef': 0.01,
+        'value_coef': 0.5,
+        'batch_size': 128,
+        'max_grad_norm': 0.5,
+        'lstm_time_window': 30,
+        'lstm_hidden_size': 128,
+        'lstm_features_out': 128,
+        'use_turbulence_threshold': True,
+        'turbulence_percentile': 90,
+        'transaction_cost_rate': 0.001,
+        'reward_scaling': 1e-4,
+        'initial_capital': 1000000,
+        'max_positions': 100,
+        'technical_indicators': ['MACD', 'RSI', 'CCI', 'ADX']
+    }
 
 # Setup logging with both console and file handlers
 def setup_logging(log_dir: str = "logs"):
@@ -317,21 +336,33 @@ class EnhancedCLSTMPPOTrainer:
             logger.info("🔧 Initializing Enhanced CLSTM-PPO Trainer")
 
         # Create data loader (each process gets its own)
-        # Check if using flat files or REST API
+        # Check if using Massive flat files (new processed format with Greeks)
+        use_massive_flat_files = self.config.get('use_massive_flat_files', False)
         use_flat_files = self.config.get('use_flat_files', False)
 
-        if use_flat_files:
-            # Use flat file data loader (much faster, offline)
+        if use_massive_flat_files:
+            # Use NEW Massive flat file data loader (has Greeks, IV calculated)
             if self.is_main_process:
-                logger.info("📁 Using flat file data loader")
+                logger.info("📁 Using Massive flat file data loader (with calculated Greeks)")
+                logger.info(f"   Data directory: {self.config.get('massive_flat_files_dir', 'data/flat_files_processed')}")
+
+            from src.data.massive_flat_file_loader import MassiveFlatFileLoader
+            self.data_loader = MassiveFlatFileLoader(
+                data_dir=self.config.get('massive_flat_files_dir', 'data/flat_files_processed'),
+                cache_in_memory=True  # Cache for fast training
+            )
+        elif use_flat_files:
+            # Use OLD flat file data loader (legacy format)
+            if self.is_main_process:
+                logger.info("📁 Using legacy flat file data loader")
                 logger.info(f"   Data directory: {self.config.get('flat_files_dir', 'data/flat_files')}")
                 logger.info(f"   File format: {self.config.get('flat_files_format', 'parquet')}")
 
-            from src.flat_file_data_loader import FlatFileDataLoader
+            from src.data.flat_file_loader import FlatFileDataLoader
             self.data_loader = FlatFileDataLoader(
                 data_dir=self.config.get('flat_files_dir', 'data/flat_files'),
                 file_format=self.config.get('flat_files_format', 'parquet'),
-                cache_in_memory=True
+                cache_in_memory=False  # Disable caching to avoid OOM with 695M rows
             )
         else:
             # Use Massive.com REST API (slower, requires internet)
@@ -502,7 +533,13 @@ class EnhancedCLSTMPPOTrainer:
                 # OPTIMIZATIONS: Enable advanced features
                 use_sharpe_shaping=self.config.get('use_sharpe_shaping', True),
                 use_greeks_sizing=self.config.get('use_greeks_sizing', True),
-                use_expiration_management=self.config.get('use_expiration_management', True)
+                use_expiration_management=self.config.get('use_expiration_management', True),
+                # STABILITY: New parameters for stable training
+                normalize_rewards=self.config.get('normalize_rewards', True),
+                reward_clip=self.config.get('reward_clip', 10.0),
+                entropy_decay=self.config.get('entropy_decay', 0.995),
+                min_entropy_coef=self.config.get('min_entropy_coef', 0.01),
+                l2_reg=self.config.get('l2_reg', 1e-4)
             )
 
             if self.is_main_process:
@@ -1183,7 +1220,7 @@ class EnhancedCLSTMPPOTrainer:
             logger.info(f"{'='*60}\n")
 
             # Create new agent for this ensemble member
-            from src.clstm_ppo_agent import OptionsCLSTMPPOAgent
+            from src.models.ppo_agent import OptionsCLSTMPPOAgent
 
             ensemble_agent = OptionsCLSTMPPOAgent(
                 observation_space=self.env.observation_space,
@@ -1258,7 +1295,9 @@ class EnhancedCLSTMPPOTrainer:
 
     def train_episode(self):
         """Train one episode with CLSTM-PPO"""
+        logger.info(f"🎬 Starting Episode {self.episode} - resetting environment...")
         obs = self.env.reset()
+        logger.info(f"✅ Environment reset complete, starting steps...")
 
         # OPTIMIZATION: Reset episode-specific components (Sharpe ratio history, etc.)
         if hasattr(self.agent, 'reset_episode'):
@@ -1280,6 +1319,8 @@ class EnhancedCLSTMPPOTrainer:
         episode_dones = []
         
         for step in range(self.env.episode_length):
+            if step < 3 or step % 50 == 0:
+                logger.info(f"  Step {step}/{self.env.episode_length}...")
             # Calculate turbulence for risk management (paper optimization)
             if self.config.get('use_turbulence_threshold', False) and hasattr(self.env, 'get_current_returns'):
                 try:
@@ -1469,8 +1510,10 @@ class EnhancedCLSTMPPOTrainer:
         most_common_action = max(action_counts.items(), key=lambda x: x[1]) if action_counts else (0, 0)
 
         # Calculate win rate
+        # Note: trade_history only contains CLOSED positions (sells), not all trades
+        # Use episode_trades for accurate win rate calculation
         profitable_trades = sum(1 for trade in self.env.trade_history if trade.get('pnl', 0) > 0)
-        total_trades_this_episode = len(self.env.trade_history)
+        total_trades_this_episode = episode_trades  # Fixed: was len(self.env.trade_history)
         win_rate = profitable_trades / max(1, total_trades_this_episode)
 
         # Enhanced episode summary
@@ -1554,6 +1597,17 @@ class EnhancedCLSTMPPOTrainer:
         # REMOVED: Reward contamination (bonuses added after training don't help)
         # The reward function in the environment is what matters for training
 
+        # Get action diversity metrics from agent
+        diversity_metrics = {}
+        if HAS_CLSTM_PPO and hasattr(self.agent, 'get_action_diversity_metrics'):
+            diversity_metrics = self.agent.get_action_diversity_metrics()
+
+            # Log to TensorBoard
+            if self.writer is not None:
+                self.writer.add_scalar('ActionDiversity/UniqueActions', diversity_metrics.get('unique_actions', 0), self.episode)
+                self.writer.add_scalar('ActionDiversity/Entropy', diversity_metrics.get('entropy', 0), self.episode)
+                self.writer.add_scalar('ActionDiversity/MaxActionRatio', diversity_metrics.get('max_action_ratio', 0), self.episode)
+
         return {
             'episode': self.episode,
             'portfolio_return': portfolio_return,
@@ -1564,7 +1618,9 @@ class EnhancedCLSTMPPOTrainer:
             'win_rate': win_rate,
             'profitable_trades': profitable_trades,
             'episode_ppo_losses': episode_ppo_losses,
-            'episode_clstm_losses': episode_clstm_losses
+            'episode_clstm_losses': episode_clstm_losses,
+            'unique_actions': unique_actions,
+            'action_diversity': diversity_metrics
         }
     
     async def train(self, num_episodes: int = None):
@@ -1885,12 +1941,16 @@ async def main():
                         help='Disable realistic transaction costs for faster learning')
 
     # Data source options
+    parser.add_argument('--use-massive-flat-files', action='store_true', default=False,
+                        help='Use Massive flat files with calculated Greeks (recommended)')
+    parser.add_argument('--massive-flat-files-dir', type=str, default='data/flat_files_processed',
+                        help='Directory containing Massive flat files (default: data/flat_files_processed)')
     parser.add_argument('--use-flat-files', action='store_true', default=False,
-                        help='Use flat files instead of REST API (much faster)')
+                        help='Use legacy flat files instead of REST API')
     parser.add_argument('--flat-files-dir', type=str, default='data/flat_files',
-                        help='Directory containing flat files (default: data/flat_files)')
+                        help='Directory containing legacy flat files (default: data/flat_files)')
     parser.add_argument('--flat-files-format', type=str, choices=['parquet', 'csv'], default='parquet',
-                        help='Flat file format (default: parquet)')
+                        help='Legacy flat file format (default: parquet)')
 
     args = parser.parse_args()
 
@@ -1920,8 +1980,41 @@ async def main():
             'JPM', 'BAC', 'GS', 'V', 'MA'  # Financials
         ]
 
-    # If using flat files, filter to only symbols that have data available
-    if args.use_flat_files:
+    # If using Massive flat files (new processed format)
+    if args.use_massive_flat_files:
+        import pandas as pd
+        from src.data.massive_flat_file_loader import MassiveFlatFileLoader
+
+        logger.info("🔍 Pre-training validation: Checking Massive flat file data...")
+
+        loader = MassiveFlatFileLoader(data_dir=args.massive_flat_files_dir)
+        available_files = loader.get_available_files()
+
+        if available_files:
+            summary = loader.get_data_summary()
+            available_symbols = summary.get('symbols', [])
+
+            logger.info(f"✅ Found {len(available_files)} parquet files in {args.massive_flat_files_dir}")
+            logger.info(f"   Total records: {summary['total_records']:,}")
+            logger.info(f"   Date range: {summary['date_range']['start']} to {summary['date_range']['end']}")
+            logger.info(f"   Symbols: {available_symbols}")
+            logger.info(f"   Unique dates: {summary['unique_dates']}")
+
+            # Filter to only symbols in the data
+            symbols_list = [s for s in symbols_list if s in available_symbols]
+
+            if not symbols_list:
+                logger.warning(f"⚠️ None of requested symbols found in data. Using available: {available_symbols}")
+                symbols_list = available_symbols[:5]  # Use up to 5 available symbols
+            else:
+                logger.info(f"📊 Using {len(symbols_list)} symbols: {symbols_list}")
+        else:
+            logger.error(f"❌ No Massive flat files found in {args.massive_flat_files_dir}")
+            logger.error("   Run: python scripts/download_flat_files.py --years 2024 --symbols SPY QQQ IWM")
+            raise ValueError(f"No data files found in {args.massive_flat_files_dir}")
+
+    # If using legacy flat files, filter to only symbols that have data available
+    elif args.use_flat_files:
         import os
         import pandas as pd
 
@@ -2003,15 +2096,31 @@ async def main():
     else:
         logger.info(f"📊 Using REST API for {len(symbols_list)} symbols")
 
+    # Check if running in stable training mode (set by train_stable.py)
+    import os
+    stable_mode = os.environ.get('STABLE_TRAINING', '0') == '1'
+
+    if stable_mode:
+        logger.info("🔒 STABLE TRAINING MODE ENABLED")
+        logger.info("   Using configuration from configs/stable_training.yaml")
+
     config = {
         'num_episodes': args.episodes,
         'use_clstm_pretraining': args.pretraining,
         'symbols': symbols_list,
         'data_days': args.data_days,  # Pass data_days to config
         'quick_test': args.quick_test,  # Pass quick_test flag for validation
-        'learning_rate_actor_critic': 3e-4,  # REDUCED: More stable learning (was 1e-3)
-        'learning_rate_clstm': 1e-3,  # REDUCED: More stable learning (was 3e-3)
-        'entropy_coef': 0.05,  # REDUCED: Prevent overtrading (was 0.2)
+        # STABILITY: Use environment variables if in stable mode, otherwise use defaults
+        'learning_rate_actor_critic': float(os.environ.get('LEARNING_RATE_ACTOR_CRITIC', '3e-4')),
+        'learning_rate_clstm': float(os.environ.get('LEARNING_RATE_CLSTM', '1e-3')),
+        'entropy_coef': float(os.environ.get('ENTROPY_COEF', '0.05')),
+        'entropy_decay': float(os.environ.get('ENTROPY_DECAY', '0.995')),
+        'min_entropy_coef': float(os.environ.get('MIN_ENTROPY_COEF', '0.01')),
+        'max_grad_norm': float(os.environ.get('MAX_GRAD_NORM', '0.5')),
+        'l2_reg': float(os.environ.get('L2_REG', '1e-4')),
+        'normalize_rewards': os.environ.get('NORMALIZE_REWARDS', 'true').lower() == 'true',
+        'reward_clip': float(os.environ.get('REWARD_CLIP', '10.0')),
+        'batch_size': int(os.environ.get('BATCH_SIZE', '64')),
         'include_technical_indicators': True,
         'include_market_microstructure': True,
         # Transaction costs (configurable via --realistic-costs / --no-realistic-costs)
@@ -2024,6 +2133,8 @@ async def main():
         # Performance optimization
         'no_step_logging': args.no_step_logging,
         # Data source (flat files vs REST API)
+        'use_massive_flat_files': args.use_massive_flat_files,
+        'massive_flat_files_dir': args.massive_flat_files_dir,
         'use_flat_files': args.use_flat_files,
         'flat_files_dir': args.flat_files_dir,
         'flat_files_format': args.flat_files_format

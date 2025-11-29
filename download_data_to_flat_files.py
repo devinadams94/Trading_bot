@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from src.historical_options_data import OptimizedHistoricalOptionsDataLoader
+from src.data.historical_loader import OptimizedHistoricalOptionsDataLoader
 
 # Try to import pyarrow for parquet support
 try:

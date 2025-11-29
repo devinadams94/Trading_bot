@@ -22,8 +22,8 @@ from typing import Dict, List, Tuple, Optional
 from gymnasium import spaces
 from datetime import datetime, timedelta
 
-from .working_options_env import WorkingOptionsEnvironment
-from .multi_leg_strategies import (
+from src.envs.options_env import WorkingOptionsEnvironment
+from src.trading.strategies import (
     MultiLegStrategyBuilder,
     StrategyType,
     MultiLegStrategy,
@@ -39,27 +39,30 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
     def __init__(self, *args, enable_multi_leg: bool = True, **kwargs):
         """
         Initialize multi-leg options environment
-        
+
         Args:
             enable_multi_leg: Enable multi-leg strategies (91 actions) or use simple (31 actions)
             All other args passed to WorkingOptionsEnvironment
         """
         # Initialize parent environment
         super().__init__(*args, **kwargs)
-        
+
         self.enable_multi_leg = enable_multi_leg
         self.strategy_builder = MultiLegStrategyBuilder()
-        
+
+        # Reward scaling for multi-leg strategies
+        self.reward_scaling = 1.0
+
         # Expand action space if multi-leg enabled
         if enable_multi_leg:
             self.action_space = spaces.Discrete(91)
             logger.info("✅ Multi-leg strategies enabled: 91 actions")
         else:
             logger.info("⚠️ Multi-leg strategies disabled: 31 actions (legacy mode)")
-        
+
         # Track multi-leg positions separately
         self.multi_leg_positions = []
-        
+
         # Statistics
         self.multi_leg_trades = 0
         self.multi_leg_profitable = 0
@@ -353,6 +356,47 @@ class MultiLegOptionsEnvironment(WorkingOptionsEnvironment):
             'num_trades': 1
         }
     
+    def _calculate_portfolio_value(self, current_data: Dict) -> float:
+        """Calculate total portfolio value including multi-leg positions"""
+        # Get base portfolio value from parent (includes capital and standard positions)
+        total_value = super()._calculate_portfolio_value(current_data)
+
+        # Add value of multi-leg positions
+        current_price = current_data['close']
+        for ml_position in self.multi_leg_positions:
+            # Estimate P&L based on price movement
+            price_change = current_price - ml_position['entry_price']
+            price_change_pct = price_change / ml_position['entry_price']
+
+            # Simplified P&L estimation for multi-leg strategies
+            # In reality, this would require evaluating each leg separately
+            # For now, use a simplified model based on strategy type
+            strategy_type = ml_position['strategy_type']
+
+            if 'spread' in strategy_type.lower():
+                # Spreads have limited profit/loss
+                if price_change_pct > 0:
+                    pnl = min(ml_position['max_profit'], ml_position['capital_required'] * price_change_pct * 2)
+                else:
+                    pnl = max(-ml_position['max_loss'], ml_position['capital_required'] * price_change_pct * 2)
+            elif 'straddle' in strategy_type.lower() or 'strangle' in strategy_type.lower():
+                # Straddles/strangles profit from large moves in either direction
+                pnl = ml_position['capital_required'] * abs(price_change_pct) * 3 - ml_position['capital_required'] * 0.5
+            elif 'condor' in strategy_type.lower() or 'butterfly' in strategy_type.lower():
+                # Condors/butterflies profit from low volatility
+                if abs(price_change_pct) < 0.02:  # Within 2%
+                    pnl = ml_position['max_profit'] * 0.5
+                else:
+                    pnl = -ml_position['capital_required'] * abs(price_change_pct)
+            else:
+                # Default: linear P&L
+                pnl = ml_position['capital_required'] * price_change_pct
+
+            # Add P&L to total value (capital_required was already deducted)
+            total_value += pnl
+
+        return total_value
+
     def reset(self):
         """Reset environment including multi-leg positions"""
         self.multi_leg_positions = []

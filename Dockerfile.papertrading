@@ -1,0 +1,54 @@
+# Multi-stage build for paper trading bot
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS base
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Install additional dependencies for paper trading
+RUN pip3 install --no-cache-dir \
+    websockets==12.0 \
+    aiohttp==3.9.1 \
+    prometheus-client==0.19.0 \
+    fastapi==0.104.1 \
+    uvicorn==0.24.0
+
+# Copy source code
+COPY src/ ./src/
+COPY run_paper_trading.py .
+
+# Create directories for models, checkpoints, and logs
+RUN mkdir -p /models /checkpoints /logs
+
+# Expose metrics port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run paper trading bot
+CMD ["python3", "run_paper_trading.py"]
+
