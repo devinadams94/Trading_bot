@@ -179,13 +179,10 @@ class CLSTMPolicyNetwork(nn.Module):
     """
     CLSTM-PPO network with SEPARATE LSTM trunks for actor and critic.
 
-    Architecture (ChatGPT recommendation to fix EV=0 issue):
+    Architecture:
         Encoder (shared)
         ├── LSTM_actor  → Attention_actor  → Policy Head
         └── LSTM_critic → Attention_critic → Value Head
-
-    This prevents actor gradients from dominating the shared representation
-    and starving the critic of useful features.
     """
     def __init__(self, obs_dim: int = 64, n_actions: int = 31, hidden_dim: int = 256, lstm_layers: int = 3):
         super().__init__()
@@ -330,7 +327,7 @@ def print_header():
 
 
 def print_status(metrics: TrainingMetrics, total_steps: int, target_steps: int, gpu_mem: float):
-    """Print live training status with PPO diagnostics"""
+    """Print live training status with PPO diagnostics (console only)"""
     stats = metrics.get_stats()
     progress = 100 * total_steps / target_steps
 
@@ -448,14 +445,9 @@ def train(args):
     scheduler_critic = optim.lr_scheduler.CosineAnnealingLR(optimizer_critic, T_max=n_iterations)
 
     logger.info(f"📈 Separate optimizers: actor LR={actor_lr:.0e}, critic LR={critic_lr:.0e}")
+    logger.info(f"🤖 CLSTM Policy Network: {sum(p.numel() for p in policy.parameters()):,} parameters")
 
-    # Count parameters
-    n_params = sum(p.numel() for p in policy.parameters())
-    logger.info(f"🤖 CLSTM Policy Network: {n_params:,} parameters")
-
-    # ========== CRITIC PRE-TRAINING (ChatGPT suggestion) ==========
-    # Collect data and pre-train critic before PPO to give it a head start
-    # Using fewer epochs and smaller LR to avoid over-fitting to random policy values
+    # ========== CRITIC PRE-TRAINING ==========
     logger.info("🏋️ Pre-training critic (light warmup)...")
 
     # Freeze actor, only train critic
@@ -526,7 +518,7 @@ def train(args):
             _, preds, _ = policy(all_obs[:10000])
             corr = torch.corrcoef(torch.stack([preds, all_returns[:10000]]))[0, 1].item()
             ev = 1 - torch.var(all_returns[:10000] - preds) / (torch.var(all_returns[:10000]) + 1e-8)
-        logger.info(f"   Epoch {epoch+1}: loss={total_loss/n_batches:.4f}, EV={ev:.3f}, corr={corr:.3f}")
+        logger.info(f"   Pretrain Epoch {epoch+1}: loss={total_loss/n_batches:.4f}, EV={ev:.3f}, corr={corr:.3f}")
 
     # Unfreeze everything for PPO
     for param in policy.parameters():
@@ -583,19 +575,18 @@ def train(args):
                 reward_buffer[step] = reward * args.reward_scale  # Scale rewards to O(1-10)
                 done_buffer[step] = terminated | truncated
 
-                # Track episode completions
+                # Track episode completions (approximate)
                 done_count = done_buffer[step].sum().item()
                 if done_count > 0:
-                    # Estimate episode stats
-                    episode_rewards_batch.extend([reward_buffer[:step+1, i].sum().item()
-                                                   for i in range(int(done_count))])
+                    episode_rewards_batch.extend(
+                        [reward_buffer[:step+1, i].sum().item() for i in range(int(done_count))]
+                    )
                     episode_lengths_batch.extend([step + 1] * int(done_count))
 
                 # Reset hidden state for done environments
                 if done_buffer[step].any():
                     done_idx = done_buffer[step].nonzero(as_tuple=True)[0]
                     if hidden is not None:
-                        # hidden is now ((actor_h, actor_c), (critic_h, critic_c))
                         hidden_actor, hidden_critic = hidden
                         hidden_actor[0][:, done_idx, :] = 0
                         hidden_actor[1][:, done_idx, :] = 0
@@ -606,10 +597,8 @@ def train(args):
         total_steps += steps_collected
         metrics.total_steps = total_steps
 
-        # Compute returns and advantages
-        # SIMPLIFIED: MC returns for value, MC advantages for policy (no GAE recursion)
+        # Compute returns and advantages (MC)
         with torch.no_grad():
-            # 1) Monte Carlo returns for value targets
             mc_returns = torch.zeros_like(reward_buffer)
             for t in reversed(range(args.n_steps)):
                 if t == args.n_steps - 1:
@@ -624,7 +613,7 @@ def train(args):
         flat_log_probs = log_prob_buffer.reshape(-1)
         flat_returns = mc_returns.reshape(-1)
 
-        # 2) MC advantages: A_t = R_t - V(s_t) using CURRENT policy values
+        # MC advantages: A_t = R_t - V(s_t) using CURRENT policy values
         with torch.no_grad():
             flat_values = []
             batch_size_val = 8192
@@ -634,14 +623,19 @@ def train(args):
                 flat_values.append(v)
             flat_values = torch.cat(flat_values, dim=0)
 
-            # Simple MC advantage: how much better was actual return vs predicted value
             flat_advantages = flat_returns - flat_values
             flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
 
-        # DEBUG: Sanity checks
-        logger.info(f"DEBUG rewards: min={reward_buffer.min().item():.4f}, mean={reward_buffer.mean().item():.4f}, std={reward_buffer.std().item():.4f}, max={reward_buffer.max().item():.4f}")
-        logger.info(f"DEBUG mc_ret:  min={flat_returns.min().item():.4f}, mean={flat_returns.mean().item():.4f}, std={flat_returns.std().item():.4f}, max={flat_returns.max().item():.4f}")
-        logger.info(f"DEBUG values:  min={flat_values.min().item():.4f}, mean={flat_values.mean().item():.4f}, std={flat_values.std().item():.4f}, max={flat_values.max().item():.4f}")
+        # DEBUG: Sanity checks — throttled
+        if iteration <= 3 or iteration % 50 == 0 or total_steps >= args.timesteps:
+            logger.info(
+                "DEBUG rollout: rewards(min=%.4f, mean=%.4f, std=%.4f, max=%.4f) | "
+                "mc_ret(min=%.4f, mean=%.4f, std=%.4f, max=%.4f) | "
+                "values(min=%.4f, mean=%.4f, std=%.4f, max=%.4f)",
+                reward_buffer.min().item(), reward_buffer.mean().item(), reward_buffer.std().item(), reward_buffer.max().item(),
+                flat_returns.min().item(), flat_returns.mean().item(), flat_returns.std().item(), flat_returns.max().item(),
+                flat_values.min().item(), flat_values.mean().item(), flat_values.std().item(), flat_values.max().item()
+            )
 
         # CHATGPT VERIFICATION: Check indexing alignment
         if iteration == 1:
@@ -651,10 +645,14 @@ def train(args):
             idx = t_test * args.n_envs + e_test
             flat_obs_te = flat_obs[idx]
             flat_ret_te = flat_returns[idx]
-            logger.info(f"INDEXING CHECK: obs match={torch.allclose(obs_te, flat_obs_te)}, ret match={ret_te.item():.4f} vs {flat_ret_te.item():.4f}")
+            logger.info(
+                "INDEXING CHECK: obs match=%s, ret match=%.4f vs %.4f",
+                str(torch.allclose(obs_te, flat_obs_te)),
+                ret_te.item(),
+                flat_ret_te.item()
+            )
 
         # CHATGPT TEST: Supervised-in-the-loop (first iteration only)
-        # If critic CAN learn with enough epochs, the wiring is correct
         if iteration == 1:
             logger.info("🔬 SUPERVISED-IN-LOOP TEST: 20 critic-only epochs on this rollout...")
             policy.train()
@@ -674,7 +672,6 @@ def train(args):
                     epoch_loss += loss.item()
                     n_batches += 1
                 if test_epoch in [0, 9, 19]:
-                    # Compute EV on full data after this epoch
                     with torch.no_grad():
                         all_vals = []
                         for s in range(0, flat_obs.shape[0], args.batch_size):
@@ -685,9 +682,14 @@ def train(args):
                         var_y = flat_returns.var()
                         ev = 1 - (flat_returns - all_vals).var() / (var_y + 1e-8)
                         corr = torch.corrcoef(torch.stack([flat_returns, all_vals]))[0, 1]
-                        logger.info(f"   Epoch {test_epoch+1}: loss={epoch_loss/n_batches:.4f}, EV={ev.item():.3f}, corr={corr.item():.3f}")
-            logger.info("🔬 If EV is high here, wiring is correct. Resetting optimizer state...")
-            # Reset to original optimizer (don't keep test optimizer state)
+                        logger.info(
+                            "   Critic-only Epoch %d: loss=%.4f, EV=%.3f, corr=%.3f",
+                            test_epoch + 1,
+                            epoch_loss / n_batches,
+                            ev.item(),
+                            corr.item()
+                        )
+            logger.info("🔬 Supervised test done; continuing with PPO...")
 
         # PPO update epochs with full diagnostics
         total_policy_loss = 0
@@ -700,10 +702,10 @@ def train(args):
         n_updates = 0
 
         target_kl = 0.02  # Target KL for early stopping
-        policy_epochs = 1  # Single policy epoch (was 2) - conservative for lower clip%
+        policy_epochs = 1  # Single policy epoch (conservative)
         extra_critic_epochs = 4  # Extra critic-only epochs
 
-        # ===== PHASE 1: Joint actor-critic updates (fewer epochs) =====
+        # ===== PHASE 1: Joint actor-critic updates =====
         for epoch in range(policy_epochs):
             indices = torch.randperm(flat_obs.shape[0], device=device)
             early_stop = False
@@ -712,14 +714,12 @@ def train(args):
                 end = min(start + args.batch_size, flat_obs.shape[0])
                 batch_idx = indices[start:end]
 
-                # Forward pass
                 logits, values, _ = policy(flat_obs[batch_idx])
                 probs = torch.softmax(logits, dim=-1)
                 dist = torch.distributions.Categorical(probs)
                 new_log_probs = dist.log_prob(flat_actions[batch_idx])
                 entropy = dist.entropy().mean()
 
-                # PPO clipped objective
                 log_ratio = new_log_probs - flat_log_probs[batch_idx]
                 ratio = torch.exp(log_ratio)
 
@@ -739,17 +739,19 @@ def train(args):
                 progress = min(1.0, total_steps / args.timesteps)
                 current_entropy_coef = entropy_coef_start + (entropy_coef_end - entropy_coef_start) * progress
 
-                # Total loss
                 loss = policy_loss + args.value_coef * value_loss - current_entropy_coef * entropy
 
-                # Update both actor and critic
                 optimizer_actor.zero_grad()
                 optimizer_critic.zero_grad()
                 loss.backward()
 
                 # Gradient norms
-                policy_grad_norm = sum(p.grad.norm(2).item()**2 for p in actor_params if p.grad is not None)**0.5
-                value_grad_norm = sum(p.grad.norm(2).item()**2 for p in critic_params if p.grad is not None)**0.5
+                policy_grad_norm = sum(
+                    (p.grad.norm(2).item() ** 2) for p in actor_params if p.grad is not None
+                ) ** 0.5
+                value_grad_norm = sum(
+                    (p.grad.norm(2).item() ** 2) for p in critic_params if p.grad is not None
+                ) ** 0.5
 
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
                 optimizer_actor.step()
@@ -791,7 +793,6 @@ def train(args):
 
         # Calculate explained variance using NEW values (after PPO update)
         with torch.no_grad():
-            # Recompute values with updated policy
             new_values = []
             batch_size_eval = 4096
             for start in range(0, flat_obs.shape[0], batch_size_eval):
@@ -800,28 +801,29 @@ def train(args):
                 new_values.append(v)
             new_values = torch.cat(new_values, dim=0)
 
-            # Use raw MC returns for EV calculation (no normalization anymore!)
             y_pred = new_values
             y_true = flat_returns
             var_y = torch.var(y_true)
             explained_var = 1 - torch.var(y_true - y_pred) / (var_y + 1e-8)
             explained_var = explained_var.item()
 
-            # Diagnostic: Check if critic predictions match returns
-            if iteration == 1 or iteration % 5 == 0:
+            # Critic diag periodically
+            if iteration == 1 or iteration % 5 == 0 or total_steps >= args.timesteps:
                 pred_mean = y_pred.mean().item()
                 pred_std = y_pred.std().item()
                 true_mean = y_true.mean().item()
                 true_std = y_true.std().item()
                 corr = torch.corrcoef(torch.stack([y_pred, y_true]))[0, 1].item()
-                logger.info(f"Critic: pred(mu={pred_mean:.3f}, std={pred_std:.3f}) vs true(mu={true_mean:.3f}, std={true_std:.3f}), corr={corr:.3f}")
+                logger.info(
+                    "Critic diag: pred(mu=%.3f, std=%.3f) vs true(mu=%.3f, std=%.3f), corr=%.3f, EV=%.3f",
+                    pred_mean, pred_std, true_mean, true_std, corr, explained_var
+                )
 
         # Calculate metrics
         iter_time = time.time() - iter_start
         steps_per_sec = steps_collected / iter_time
         gpu_mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
 
-        # Update metrics with full diagnostics
         metrics.update(
             rewards=episode_rewards_batch[-100:] if episode_rewards_batch else [0],
             lengths=episode_lengths_batch[-100:] if episode_lengths_batch else [0],
@@ -838,7 +840,7 @@ def train(args):
             approx_kl=total_approx_kl / max(n_updates, 1)
         )
 
-        # Log to TensorBoard (including diagnostics)
+        # Log to TensorBoard
         stats = metrics.get_stats()
         writer.add_scalar('train/reward', stats['avg_reward'], total_steps)
         writer.add_scalar('train/policy_loss', stats['policy_loss'], total_steps)
@@ -846,7 +848,6 @@ def train(args):
         writer.add_scalar('train/entropy', stats['entropy'], total_steps)
         writer.add_scalar('train/steps_per_sec', steps_per_sec, total_steps)
         writer.add_scalar('train/learning_rate', scheduler_actor.get_last_lr()[0], total_steps)
-        # PPO diagnostics
         writer.add_scalar('diagnostics/approx_kl', stats['approx_kl'], total_steps)
         writer.add_scalar('diagnostics/clip_fraction', stats['clip_frac'], total_steps)
         writer.add_scalar('diagnostics/explained_variance', stats['explained_var'], total_steps)
@@ -854,8 +855,29 @@ def train(args):
         writer.add_scalar('diagnostics/policy_grad_norm', stats['policy_grad_norm'], total_steps)
         writer.add_scalar('diagnostics/value_grad_norm', stats['value_grad_norm'], total_steps)
 
-        # Print status
-        if time.time() - last_log_time > 2:  # Every 2 seconds
+        # NEW: compact per-iteration summary into training.log
+        if (
+            iteration == 1 or
+            iteration % args.log_interval == 0 or
+            total_steps >= args.timesteps
+        ):
+            logger.info(
+                "ITER %05d | steps=%9d | avg_reward=%+6.3f | best=%+6.3f | "
+                "EV=%.3f | KL=%.4f | clip=%.3f | entropy=%.4f (%.1f%% init) | sps=%7.0f",
+                iteration,
+                total_steps,
+                stats['avg_reward'],
+                stats['best_reward'],
+                stats['explained_var'],
+                stats['approx_kl'],
+                stats['clip_frac'],
+                stats['entropy'],
+                stats['entropy_ratio'] * 100.0,
+                stats['sps']
+            )
+
+        # Console pretty print
+        if time.time() - last_log_time > 2:  # Every ~2 seconds
             print_status(metrics, total_steps, args.timesteps, gpu_mem)
             last_log_time = time.time()
 
@@ -906,24 +928,20 @@ if __name__ == '__main__':
     parser.add_argument('--n-steps', type=int, default=256, help='Steps per rollout')
     parser.add_argument('--batch-size', type=int, default=8192, help='Mini-batch size')
     parser.add_argument('--hidden-dim', type=int, default=256, help='LSTM hidden dimension')
-    # Standard PPO hyperparameters (SB3/SpinningUp defaults)
-    # LR tuned down to reduce KL/clip fraction (was 2e-4, now 1e-4)
+    # Standard PPO hyperparameters
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate (actor)')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-    parser.add_argument('--gae-lambda', type=float, default=0.95, help='GAE lambda')
-    # Clip epsilon reduced from 0.2 -> 0.1 for tighter trust region
+    parser.add_argument('--gae-lambda', type=float, default=0.95, help='GAE lambda (unused with MC advantage)')
     parser.add_argument('--clip-epsilon', type=float, default=0.10, help='PPO clip epsilon')
-    parser.add_argument('--value-coef', type=float, default=1.0, help='Value loss coefficient (increased to push critic harder)')
-    # Slightly higher entropy coef with decay (0.02 -> 0.005)
+    parser.add_argument('--value-coef', type=float, default=1.0, help='Value loss coefficient')
     parser.add_argument('--entropy-coef', type=float, default=0.02, help='Initial entropy coefficient')
     parser.add_argument('--entropy-coef-final', type=float, default=0.005, help='Final entropy coefficient')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='Max gradient norm')
-    parser.add_argument('--reward-scale', type=float, default=0.02, help='Fixed reward scale (1/50) to get returns O(1-10)')
-    # Standard PPO epochs (3-5)
-    parser.add_argument('--n-epochs', type=int, default=4, help='PPO epochs per iteration')
+    parser.add_argument('--reward-scale', type=float, default=0.02, help='Fixed reward scale to keep returns O(1-10)')
+    parser.add_argument('--n-epochs', type=int, default=4, help='(Unused: policy_epochs is fixed to 1)')
     parser.add_argument('--save-interval', type=int, default=300, help='Checkpoint save interval (seconds)')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile')
+    parser.add_argument('--log-interval', type=int, default=50, help='Iterations between summary log lines')
     args = parser.parse_args()
 
     train(args)
-
