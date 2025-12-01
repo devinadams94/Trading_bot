@@ -36,6 +36,7 @@ class GPUOptionsEnvironment:
         max_positions: int = 5,
         episode_length: int = 256,
         device: str = 'cuda',
+        cache_path: str = None,
     ):
         self.n_envs = n_envs
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -44,16 +45,17 @@ class GPUOptionsEnvironment:
         self.episode_length = episode_length
         self.symbols = symbols or ['SPY', 'QQQ', 'IWM']
         self.n_symbols = len(self.symbols)
-        
+        self.cache_path = cache_path  # Custom cache path (optional)
+
         # Action space: 31 actions (hold + 10 calls + 10 puts per symbol direction)
         self.n_actions = 31
-        
+
         # Observation dimensions
         self.obs_dim = 64  # Market features + portfolio state
-        
+
         # Pre-allocate GPU tensors for all environments
         self._init_gpu_tensors()
-        
+
         # Load and preprocess data to GPU
         if data_loader:
             self._load_data_to_gpu(data_loader)
@@ -94,7 +96,8 @@ class GPUOptionsEnvironment:
         import os
 
         # Check for pre-built cache first (instant loading!)
-        cache_path = 'data/gpu_cache.pt'
+        # Use custom cache_path if provided, otherwise default
+        cache_path = self.cache_path or 'data/gpu_cache.pt'
         if os.path.exists(cache_path):
             logger.info("⚡ Loading pre-built GPU cache (instant load)...")
             try:

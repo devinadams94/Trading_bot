@@ -1,11 +1,7 @@
 # Environments module
-from src.envs.options_env import WorkingOptionsEnvironment
-from src.envs.multi_leg_env import MultiLegOptionsEnvironment
-from src.envs.paper_trading_env import PaperTradingEnvironment
+from src.envs.gpu_options_env import GPUOptionsEnvironment
 
 __all__ = [
-    'WorkingOptionsEnvironment',
-    'MultiLegOptionsEnvironment',
-    'PaperTradingEnvironment'
+    'GPUOptionsEnvironment',
 ]
 

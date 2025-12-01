@@ -52,10 +52,13 @@ training_test.log
 !docs/images/*.png
 !docs/images/*.jpg
 
-# Data cache
+# Data cache and large data files
 data/options_cache/
 data/test_cache/
 data/flat_files/
+data/flat_files_processed/
+data/v1_*/
+data/*.pt
 *.cache
 *.parquet
 *.csv.gz
@@ -88,6 +91,7 @@ docs/_build/
 
 # Archive (old files for reference - not needed in repo)
 archive/
+_archive/
 
 # Cleanup scripts (used once, not needed in repo)
 cleanup_repo.sh
