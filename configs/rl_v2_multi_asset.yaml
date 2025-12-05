@@ -1,0 +1,115 @@
+# ==============================================================================
+# v2 Multi-Asset Baseline Configuration
+# ==============================================================================
+# This is the canonical config for the multi-asset portfolio RL agent.
+# OOS validated: trained on 2015-2019, tested on 2020-2024 (RL ranks #2).
+# ==============================================================================
+
+# ==============================================================================
+# MODEL CONFIGURATION
+# ==============================================================================
+model:
+  architecture: "SimplePolicyNetwork"  # GRU-based, ~110K params
+  obs_dim: 64                          # Observation vector dimension
+  hidden_dim: 128                      # GRU hidden size
+  rnn_type: "gru"                      # RNN type (gru or lstm)
+  rnn_layers: 1                        # Number of RNN layers
+
+# ==============================================================================
+# PPO HYPERPARAMETERS
+# ==============================================================================
+ppo:
+  learning_rate: 3.0e-4                # Standard PPO LR
+  batch_size: 2048                     # Mini-batch size for updates
+  n_steps: 256                         # Steps per rollout before update
+  n_epochs: 4                          # PPO epochs per iteration
+  gamma: 0.99                          # Discount factor
+  clip_epsilon: 0.2                    # PPO clipping parameter
+  entropy_coef: 0.01                   # Initial entropy coefficient
+  entropy_coef_final: 0.005            # Final entropy coefficient (linear decay)
+  value_coef: 0.5                      # Value loss coefficient
+  max_grad_norm: 0.5                   # Gradient clipping threshold
+  reward_scale: 0.1                    # Reward scaling (raw * scale)
+
+# ==============================================================================
+# ENVIRONMENT CONFIGURATION
+# ==============================================================================
+env:
+  env_class: "MultiAssetEnvironment"
+  n_envs: 2048                         # Parallel environments
+  episode_length: 256                  # Steps per episode
+  initial_capital: 100000              # Starting portfolio value ($)
+  
+  # Assets: weight order is [CASH=0, SPY=1, QQQ=2, IWM=3]
+  assets:
+    - CASH
+    - SPY
+    - QQQ
+    - IWM
+  
+  # Portfolio regime actions (16 total)
+  # Each action maps to target weights [CASH, SPY, QQQ, IWM]
+  actions:
+    0:  {name: "HOLD",          weights: null}                    # Keep current
+    1:  {name: "ALL_CASH",      weights: [1.00, 0.00, 0.00, 0.00]}
+    2:  {name: "ALL_SPY",       weights: [0.00, 1.00, 0.00, 0.00]}
+    3:  {name: "ALL_QQQ",       weights: [0.00, 0.00, 1.00, 0.00]}
+    4:  {name: "ALL_IWM",       weights: [0.00, 0.00, 0.00, 1.00]}
+    5:  {name: "EQUAL_WEIGHT",  weights: [0.25, 0.25, 0.25, 0.25]}
+    6:  {name: "SPY_QQQ_50",    weights: [0.00, 0.50, 0.50, 0.00]}
+    7:  {name: "SPY_IWM_50",    weights: [0.00, 0.50, 0.00, 0.50]}
+    8:  {name: "QQQ_IWM_50",    weights: [0.00, 0.00, 0.50, 0.50]}
+    9:  {name: "DEFENSIVE_50",  weights: [0.50, 0.25, 0.00, 0.25]}
+    10: {name: "GROWTH_TILT",   weights: [0.10, 0.30, 0.60, 0.00]}
+    11: {name: "VALUE_TILT",    weights: [0.10, 0.60, 0.00, 0.30]}
+    12: {name: "SMALLCAP_TILT", weights: [0.10, 0.20, 0.00, 0.70]}
+    13: {name: "RISK_OFF_75",   weights: [0.75, 0.25, 0.00, 0.00]}
+    14: {name: "QQQ_HEAVY",     weights: [0.10, 0.10, 0.70, 0.10]}
+    15: {name: "BALANCED",      weights: [0.20, 0.40, 0.20, 0.20]}
+  
+  # Reward configuration (simplified: alpha - trading_cost only)
+  trading_cost: 0.001                  # 0.1% per rebalance
+  volatility_penalty: 0.0              # Not used in training reward
+  drawdown_penalty: 0.0                # Not used in training reward
+  
+  # Benchmark for alpha calculation
+  benchmark: "equal_weight_equity"     # Equal weight of SPY/QQQ/IWM
+
+# ==============================================================================
+# DATA CONFIGURATION
+# ==============================================================================
+data:
+  train_cache_path: "data/v2_train_2015_2019/gpu_cache_train.pt"
+  test_cache_path: "data/v2_test_2020_2024/gpu_cache_test.pt"
+
+# ==============================================================================
+# TRAINING CONFIGURATION
+# ==============================================================================
+training:
+  total_timesteps: 5_000_000           # Target training steps
+  save_interval: 300                   # Checkpoint save interval (seconds)
+  log_interval: 10                     # Iterations between log lines
+  compile_model: false                 # torch.compile (experimental)
+
+# ==============================================================================
+# BASELINE POLICIES FOR COMPARISON
+# ==============================================================================
+# Used by eval_with_baselines.py to benchmark RL performance
+baselines:
+  - ALL_CASH
+  - ALL_SPY
+  - ALL_QQQ
+  - ALL_IWM
+  - EQUAL_WEIGHT
+  - DEFENSIVE_50
+  - BALANCED
+
+# ==============================================================================
+# SUCCESS CRITERIA (regression checks)
+# ==============================================================================
+# If RL Sharpe falls below these thresholds on test data, something is wrong
+regression_checks:
+  min_sharpe_vs_spy: -0.5              # RL Sharpe >= SPY Sharpe - 0.5
+  min_sharpe_absolute: 0.0             # RL Sharpe >= 0
+  max_turnover_pct: 50.0               # Turnover <= 50% (not thrashing)
+

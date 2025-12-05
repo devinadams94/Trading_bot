@@ -1,0 +1,161 @@
+# Stable Training Configuration
+# Purpose: Prevent overfitting, encourage exploration, ensure robust learning
+
+# ============================================================================
+# LEARNING RATES - Reduced for stability
+# ============================================================================
+learning_rate_actor_critic: 1.0e-4  # Reduced from 3e-4 for stable policy updates
+learning_rate_clstm: 3.0e-4         # Reduced from 1e-3 for stable feature learning
+learning_rate_decay: 0.99           # Exponential decay per 100 episodes
+min_learning_rate: 1.0e-6           # Minimum LR floor
+
+# ============================================================================
+# EXPLORATION - Increased for action diversity
+# ============================================================================
+entropy_coef: 0.20                  # Increased from 0.05 to encourage exploration
+entropy_decay: 0.995                # Decay entropy over time (0.20 → 0.01)
+min_entropy_coef: 0.01              # Minimum entropy to maintain some exploration
+entropy_decay_start: 50             # Start decaying after 50 episodes
+
+# ============================================================================
+# PPO HYPERPARAMETERS - Standard stable values
+# ============================================================================
+clip_epsilon: 0.2                   # PPO clipping parameter (standard)
+value_coef: 0.5                     # Value loss coefficient (standard)
+gamma: 0.99                         # Discount factor (standard)
+gae_lambda: 0.95                    # GAE parameter for advantage estimation
+batch_size: 64                      # Reduced from 128 for more gradient updates
+n_epochs: 10                        # Number of PPO epochs per update
+buffer_size: 2048                   # Experience buffer size
+
+# ============================================================================
+# TRAINING STABILITY - Prevent exploding gradients
+# ============================================================================
+max_grad_norm: 0.5                  # Gradient clipping threshold
+normalize_advantages: true          # Normalize advantages for stable learning
+normalize_rewards: true             # Normalize rewards using running mean/std
+reward_clip: 10.0                   # Clip rewards to [-10, 10]
+
+# ============================================================================
+# REGULARIZATION - Prevent overfitting
+# ============================================================================
+l2_reg: 1.0e-4                      # L2 weight decay
+dropout: 0.1                        # Dropout rate in actor/critic networks
+action_diversity_bonus: 0.01        # Bonus for using diverse actions
+action_repetition_penalty: 0.05     # Penalty if same action used >10 times in episode
+max_same_action_ratio: 0.3          # Max ratio of same action per episode (30%)
+
+# ============================================================================
+# DATA HANDLING - Train/validation split
+# ============================================================================
+train_val_split: 0.8                # 80% train, 20% validation
+shuffle_episodes: true              # Shuffle training data each epoch
+validation_frequency: 10            # Validate every N episodes
+early_stopping_patience: 100        # Stop if no improvement for N episodes
+early_stopping_min_delta: 0.001     # Minimum improvement threshold
+
+# ============================================================================
+# REWARD SHAPING - Balanced incentives
+# ============================================================================
+reward_scale: 1.0                   # Base reward scaling (adaptive)
+trade_penalty_ratio: 0.0001         # Trade penalty as ratio of portfolio value
+position_limit_penalty: 0.1         # Penalty for hitting position limits
+drawdown_penalty: 0.5               # Penalty for large drawdowns
+sharpe_bonus: 0.05                  # Bonus for high Sharpe ratio
+
+# ============================================================================
+# ENVIRONMENT SETTINGS
+# ============================================================================
+symbols:
+  # Core ETFs (high liquidity, stable)
+  - SPY
+  - QQQ
+  - IWM
+  # Mega cap tech (high options volume)
+  - AAPL
+  - MSFT
+  - NVDA
+  - TSLA
+  - AMZN
+  - GOOGL
+  - META
+
+initial_capital: 100000
+max_positions: 5
+episode_length: 120                 # Steps per episode
+lookback_window: 20                 # Historical data window
+
+# ============================================================================
+# TRANSACTION COSTS - Realistic settings
+# ============================================================================
+use_realistic_costs: true
+enable_slippage: true
+slippage_model: 'volume_based'
+commission_per_contract: 0.65       # Per contract commission
+min_commission: 1.00                # Minimum commission per trade
+
+# ============================================================================
+# FEATURES - What to include
+# ============================================================================
+include_technical_indicators: true
+include_market_microstructure: true
+include_greeks: true
+use_sharpe_shaping: true            # Use Sharpe ratio in reward
+use_greeks_sizing: true             # Use Greeks for position sizing
+use_expiration_management: true     # Manage option expirations
+
+# ============================================================================
+# TRAINING SCHEDULE
+# ============================================================================
+num_episodes: 500                   # Total episodes to train
+save_frequency: 50                  # Save checkpoint every N episodes
+log_frequency: 10                   # Log metrics every N episodes
+tensorboard_log_frequency: 1        # Log to TensorBoard every episode
+
+# ============================================================================
+# DATA SOURCE
+# ============================================================================
+use_flat_files: true
+flat_files_dir: 'data/flat_files'
+flat_files_format: 'parquet'
+data_days: 60                       # Use last 60 days of data
+
+# ============================================================================
+# MULTI-GPU SETTINGS
+# ============================================================================
+use_multi_gpu: false                # Disable for stability (use single GPU)
+mixed_precision: false              # Disable FP16 for numerical stability
+compile_model: false                # Disable PyTorch compilation for debugging
+
+# ============================================================================
+# ADVANCED FEATURES - Disable for initial stable training
+# ============================================================================
+enable_multi_leg: false             # Use 31 actions (not 91)
+use_ensemble: false                 # Single model (not ensemble)
+use_clstm_pretraining: false        # Skip pretraining for now
+
+# ============================================================================
+# MONITORING - What to track
+# ============================================================================
+track_action_diversity: true        # Track unique actions per episode
+track_validation_metrics: true      # Track validation performance
+track_sharpe_ratio: true            # Track Sharpe ratio
+track_drawdown: true                # Track maximum drawdown
+track_position_distribution: true   # Track position types (calls/puts)
+
+# ============================================================================
+# SUCCESS CRITERIA - When to consider training successful
+# ============================================================================
+target_sharpe_ratio: 1.5            # Target Sharpe ratio
+target_win_rate: 0.55               # Target win rate (55%)
+target_profit_rate: 0.60            # Target profitability rate (60%)
+target_return: 0.15                 # Target return per episode (15%)
+min_action_diversity: 10            # Minimum unique actions per episode
+
+# ============================================================================
+# DEBUGGING
+# ============================================================================
+debug_mode: false
+verbose_logging: false
+save_episode_videos: false
+

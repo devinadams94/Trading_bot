@@ -41,7 +41,9 @@ ENV/
 checkpoints/
 logs/
 wandb/
+runs/
 *.log
+training_test.log
 
 # Images (except documentation images)
 *.png
@@ -50,10 +52,16 @@ wandb/
 !docs/images/*.png
 !docs/images/*.jpg
 
-# Data cache
+# Data cache and large data files
 data/options_cache/
 data/test_cache/
+data/flat_files/
+data/flat_files_processed/
+data/v1_*/
+data/*.pt
 *.cache
+*.parquet
+*.csv.gz
 
 # Config (keep templates, ignore local configs)
 config/__pycache__/
@@ -83,6 +91,7 @@ docs/_build/
 
 # Archive (old files for reference - not needed in repo)
 archive/
+_archive/
 
 # Cleanup scripts (used once, not needed in repo)
 cleanup_repo.sh
@@ -94,21 +103,44 @@ research_paper.pdf
 # Old/unused scripts
 live_trading_ppo_lstm.py
 models/
-
 fix_training_environment.sh
-TRAINING_READINESS_SUMMARY.md
-TRAINING_ENVIRONMENT_VERIFICATION.md
-=0.8.0
-=3.0.0
-ALPACA_DATA_FIX.md
-OPTIMIZATION_IMPLEMENTATIONS.md
-OPTIMIZATIONS_COMPLETE.md
 check_gpu_setup.py
 clear_cache_and_verify.sh
-COST_CALCULATOR_UPDATE.md
-DATA_FLOW_SUMMARY.md
-GPU_COMPARISON_2025.md
-ossh
-ossh.pub
 train_distributed_clstm_ppo.py
 train_ensemble.py
+
+# Generated docs (keep README.md)
+*_COMPLETE.md
+*_SUMMARY.md
+*_GUIDE.md
+*_FIXES.md
+*_ASSESSMENT.md
+*_RECOMMENDATIONS.md
+*_STABILIZED.md
+*_VERIFICATION.md
+ALPACA_*.md
+COST_*.md
+DATA_*.md
+GPU_*.md
+OPTIMIZATION*.md
+
+# One-off utility scripts
+build_*.py
+download_*.py
+download_*.sh
+process_*.py
+recalculate_*.py
+verify_*.py
+calculate_*.py
+convert_*.py
+setup_*.sh
+test_*.sh
+
+# SSH keys
+ossh
+ossh.pub
+*.pem
+
+# Misc pip artifacts
+=0.8.0
+=3.0.0
