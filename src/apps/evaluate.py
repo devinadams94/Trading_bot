@@ -24,55 +24,54 @@ import torch.nn as nn
 import numpy as np
 
 
-class CLSTMPolicyNetwork(nn.Module):
-    """CLSTM-PPO network with separate LSTM trunks for actor and critic."""
-    
-    def __init__(self, obs_dim: int = 64, n_actions: int = 31, hidden_dim: int = 256, lstm_layers: int = 3):
+import numpy as np
+
+
+class SimplePolicyNetwork(nn.Module):
+    """
+    Simplified PPO network for stable training (Phase 0).
+    Matches the architecture in train.py.
+    """
+    def __init__(self, obs_dim: int = 64, n_actions: int = 16, hidden_dim: int = 128):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.lstm_layers = lstm_layers
-        
+
+        # Shared encoder
         self.encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1)
+            nn.LayerNorm(hidden_dim),
         )
-        
-        self.lstm_actor = nn.LSTM(hidden_dim, hidden_dim, lstm_layers, batch_first=True,
-                                   dropout=0.1 if lstm_layers > 1 else 0)
-        self.lstm_critic = nn.LSTM(hidden_dim, hidden_dim, lstm_layers, batch_first=True,
-                                    dropout=0.1 if lstm_layers > 1 else 0)
-        
-        self.attention_actor = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True, dropout=0.1)
-        self.attention_critic = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True, dropout=0.1)
-        
-        self.policy = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, n_actions))
-        self.value = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+
+        # Single shared GRU
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # Simple heads
+        self.policy_head = nn.Linear(hidden_dim, n_actions)
+        self.value_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, x, hidden=None):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         batch_size = x.shape[0]
+
         encoded = self.encoder(x)
-        
+
         if hidden is None:
-            hidden_actor = (torch.zeros(self.lstm_layers, batch_size, self.hidden_dim, device=x.device),
-                           torch.zeros(self.lstm_layers, batch_size, self.hidden_dim, device=x.device))
-            hidden_critic = (torch.zeros(self.lstm_layers, batch_size, self.hidden_dim, device=x.device),
-                            torch.zeros(self.lstm_layers, batch_size, self.hidden_dim, device=x.device))
-        else:
-            hidden_actor, hidden_critic = hidden
-        
-        lstm_actor_out, new_hidden_actor = self.lstm_actor(encoded, hidden_actor)
-        attn_actor_out, _ = self.attention_actor(lstm_actor_out, lstm_actor_out, lstm_actor_out)
-        logits = self.policy(attn_actor_out[:, -1, :])
-        
-        lstm_critic_out, new_hidden_critic = self.lstm_critic(encoded, hidden_critic)
-        attn_critic_out, _ = self.attention_critic(lstm_critic_out, lstm_critic_out, lstm_critic_out)
-        value = self.value(attn_critic_out[:, -1, :])
-        
-        return logits, value.squeeze(-1), (new_hidden_actor, new_hidden_critic)
+            hidden = torch.zeros(1, batch_size, self.hidden_dim, device=x.device)
+
+        gru_out, new_hidden = self.gru(encoded, hidden)
+        features = gru_out[:, -1, :]
+
+        logits = self.policy_head(features)
+        value = self.value_head(features).squeeze(-1)
+
+        return logits, value, new_hidden
 
     def get_action(self, obs, hidden=None, deterministic=False):
         logits, value, new_hidden = self.forward(obs, hidden)
@@ -84,25 +83,24 @@ class CLSTMPolicyNetwork(nn.Module):
         return action, value, new_hidden
 
 
-def load_model(model_dir: str, device: str = 'cuda') -> CLSTMPolicyNetwork:
+def load_model(model_dir: str, device: str = 'cuda') -> SimplePolicyNetwork:
     """Load a frozen model from a model directory."""
     config_path = os.path.join(model_dir, "inference_config.json")
     model_path = os.path.join(model_dir, "model.pt")
-    
+
     with open(config_path, "r") as f:
         cfg = json.load(f)
-    
-    model = CLSTMPolicyNetwork(
-        obs_dim=cfg["obs_dim"],
-        n_actions=cfg["n_actions"],
-        hidden_dim=cfg["hidden_dim"],
-        lstm_layers=cfg["lstm_layers"]
+
+    model = SimplePolicyNetwork(
+        obs_dim=cfg.get("obs_dim", 64),
+        n_actions=cfg.get("n_actions", 16),
+        hidden_dim=cfg.get("hidden_dim", 128),
     ).to(device)
-    
+
     state = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
-    
+
     return model, cfg
 
 
@@ -139,28 +137,33 @@ def evaluate(model_dir: str, data_dir: str, n_episodes: int = 100, n_envs: int =
     # Find cache file
     cache_path = find_cache_file(data_dir)
     print(f"\n📊 Loading data from: {cache_path}")
-    
-    # Create environment
-    from src.envs.gpu_options_env import GPUOptionsEnvironment
-    env = GPUOptionsEnvironment(
-        data_loader='cache',
-        symbols=['SPY', 'QQQ', 'IWM'],
+
+    # Create Multi-Asset Portfolio environment
+    from src.envs.multi_asset_env import MultiAssetEnvironment, print_regime_info
+    print_regime_info()
+
+    env = MultiAssetEnvironment(
         n_envs=n_envs,
         episode_length=episode_length,
         device=device,
-        cache_path=cache_path
+        cache_path=cache_path,
+        volatility_penalty=0.5,
+        drawdown_penalty=0.2,
+        trading_cost=0.001,
     )
-    print(f"   ✅ Environment ready with {env.n_days} trading days")
+    n_actions = env.n_actions
+    print(f"   ✅ Environment ready with {env.n_days} trading days, {n_actions} actions")
     
     # Tracking metrics
     all_episode_returns = []
     all_episode_pnls = []
     all_final_values = []
+    all_actions = []  # Track action distribution
     episode_count = 0
-    
+
     print(f"\n🚀 Running evaluation...")
     start_time = time.time()
-    
+
     with torch.no_grad():
         while episode_count < n_episodes:
             obs, _ = env.reset()
@@ -171,6 +174,7 @@ def evaluate(model_dir: str, data_dir: str, n_episodes: int = 100, n_envs: int =
 
             for step in range(episode_length):
                 actions, _, hidden = model.get_action(obs, hidden, deterministic=deterministic)
+                all_actions.extend(actions.cpu().tolist())
                 obs, rewards, terminated, truncated, _ = env.step(actions)
                 episode_rewards += rewards
                 # rewards are raw_returns * 100, so divide by 100 to get actual %
@@ -229,6 +233,11 @@ def evaluate(model_dir: str, data_dir: str, n_episodes: int = 100, n_envs: int =
     gross_loss = abs(pnls[pnls < 0].sum()) if (pnls < 0).any() else 1e-8
     profit_factor = gross_profit / gross_loss
     
+    # Action distribution analysis
+    action_counts = np.bincount(all_actions, minlength=n_actions)
+    action_probs = action_counts / action_counts.sum()
+    top_actions = action_probs.argsort()[::-1][:5]  # Top 5 most used
+
     # Print results
     print("\n" + "=" * 70)
     print("  EVALUATION RESULTS")
@@ -237,19 +246,29 @@ def evaluate(model_dir: str, data_dir: str, n_episodes: int = 100, n_envs: int =
     print(f"   Episodes evaluated:     {len(returns)}")
     print(f"   Avg episode reward:     {returns.mean():.2f} ± {returns.std():.2f}")
     print(f"   Min/Max reward:         {returns.min():.2f} / {returns.max():.2f}")
-    
+
     print(f"\n💰 Financial Metrics:")
     print(f"   Initial capital:        ${initial_capital:,.0f}")
     print(f"   Avg final value:        ${final_values.mean():,.0f}")
     print(f"   Total return:           {total_return_pct:+.2f}%")
     print(f"   Avg PnL per episode:    ${pnls.mean():,.2f}")
-    
+
     print(f"\n📈 Risk Metrics:")
     print(f"   Sharpe ratio (ann.):    {sharpe:.3f}")
     print(f"   Max drawdown:           ${max_drawdown:,.0f} ({max_drawdown_pct:.2f}%)")
     print(f"   Win rate:               {win_rate:.1f}%")
     print(f"   Profit factor:          {profit_factor:.2f}")
-    
+
+    print(f"\n🎯 Action Distribution (Top 5):")
+    for action_idx in top_actions:
+        regime_name = env.portfolio_regimes[action_idx][0]
+        pct = action_probs[action_idx] * 100
+        print(f"   {regime_name:20s}: {pct:5.1f}%")
+
+    # Check for policy collapse
+    if action_probs.max() > 0.8:
+        print(f"\n⚠️  WARNING: Policy collapsed to single action ({action_probs.max()*100:.1f}% {env.portfolio_regimes[action_probs.argmax()][0]})")
+
     print(f"\n⏱️  Evaluation time:        {elapsed:.1f}s ({len(returns)/elapsed:.1f} episodes/sec)")
     print("=" * 70)
     

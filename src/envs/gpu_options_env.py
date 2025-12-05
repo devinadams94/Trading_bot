@@ -37,6 +37,7 @@ class GPUOptionsEnvironment:
         episode_length: int = 256,
         device: str = 'cuda',
         cache_path: str = None,
+        lot_size: float = 10.0,  # 10 shares per unit (allows ~100% SPY exposure)
     ):
         self.n_envs = n_envs
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -46,6 +47,7 @@ class GPUOptionsEnvironment:
         self.symbols = symbols or ['SPY', 'QQQ', 'IWM']
         self.n_symbols = len(self.symbols)
         self.cache_path = cache_path  # Custom cache path (optional)
+        self.lot_size = lot_size  # Shares per unit (default: 10 for ~100% SPY exposure)
 
         # Action space: 31 actions (hold + 10 calls + 10 puts per symbol direction)
         self.n_actions = 31
@@ -78,14 +80,26 @@ class GPUOptionsEnvironment:
         self.positions = torch.zeros((self.n_envs, self.max_positions, 6),
                                       device=self.device, dtype=torch.float32)
         self.n_positions = torch.zeros(self.n_envs, device=self.device, dtype=torch.int32)
-        
+
+        # NEW: Underlying position tracking (in "units", 1 unit = 100 shares of underlying)
+        # This is for the simplified trading model where we trade the underlying (SPY)
+        self.underlying_position = torch.zeros(self.n_envs, device=self.device, dtype=torch.float32)
+
         # Time tracking
         self.current_step = torch.zeros(self.n_envs, device=self.device, dtype=torch.int32)
         self.current_day_idx = torch.zeros(self.n_envs, device=self.device, dtype=torch.int64)
-        
+
         # Episode tracking
         self.episode_returns = torch.zeros(self.n_envs, device=self.device, dtype=torch.float32)
         self.done = torch.zeros(self.n_envs, device=self.device, dtype=torch.bool)
+
+        # For alpha-based reward: track previous SPY price and position
+        self.prev_spy_price = torch.zeros(self.n_envs, device=self.device, dtype=torch.float32)
+        self.prev_position = torch.zeros(self.n_envs, device=self.device, dtype=torch.float32)
+
+        # Reward hyperparameters (alpha vs benchmark)
+        self.trading_cost = 1e-4  # Cost per unit of position change (0.01% per trade)
+        self.position_penalty = 0.0  # REMOVED: was penalizing holding, causing "stay in cash" exploit
     
     def _load_data_to_gpu(self, data_source):
         """Load market data to GPU tensors
@@ -305,14 +319,19 @@ class GPUOptionsEnvironment:
         self.portfolio_value.copy_(self.capital)
         self.positions.zero_()
         self.n_positions.zero_()
+        self.underlying_position.zero_()  # Reset underlying positions
         self.current_step.zero_()
         self.episode_returns.zero_()
         self.done.zero_()
+        self.prev_position.zero_()  # Reset position tracking for reward
 
         # Random starting days for each environment
         max_start = max(0, self.n_days - self.episode_length - 1)
         self.current_day_idx = torch.randint(20, max_start + 20, (self.n_envs,),
                                               device=self.device, dtype=torch.int64)
+
+        # Initialize prev_spy_price for alpha calculation
+        self.prev_spy_price = self.prices[self.current_day_idx, 0, 3]  # SPY close price
 
         obs = self._get_observations()
         return obs, {}
@@ -376,9 +395,11 @@ class GPUOptionsEnvironment:
 
         # Get current prices
         current_prices = self.prices[self.current_day_idx, :, 3]  # [n_envs, n_symbols]
+        current_spy_price = current_prices[:, 0]  # SPY close
 
         # Calculate rewards based on portfolio change
         old_value = self.portfolio_value.clone()
+        old_position = self.underlying_position.clone()
 
         # Execute actions (vectorized)
         self._execute_actions_gpu(actions, current_prices)
@@ -386,11 +407,30 @@ class GPUOptionsEnvironment:
         # Update portfolio value
         self._update_portfolio_value_gpu(current_prices)
 
-        # Calculate rewards (percentage returns, scaled and clipped)
-        # Simple fixed transform: scale by 100 then clip to [-5, 5]
-        # This is stable and doesn't change distribution during training
-        raw_returns = (self.portfolio_value - old_value) / (old_value + 1e-8)
-        rewards = torch.clamp(raw_returns * 100.0, -5.0, 5.0)
+        # ===== ALPHA-BASED REWARD =====
+        # Portfolio return
+        portfolio_return = (self.portfolio_value - old_value) / (old_value + 1e-8)
+
+        # Benchmark (SPY) return
+        benchmark_return = (current_spy_price - self.prev_spy_price) / (self.prev_spy_price + 1e-8)
+
+        # Alpha = portfolio return - benchmark return
+        alpha = portfolio_return - benchmark_return
+
+        # Trading cost: penalize position changes
+        position_change = torch.abs(self.underlying_position - old_position)
+        trading_cost_penalty = self.trading_cost * position_change
+
+        # Position holding penalty: small cost for holding positions (encourages active trading)
+        position_holding_penalty = self.position_penalty * torch.abs(self.underlying_position)
+
+        # Final reward: alpha minus costs, scaled and clipped
+        raw_reward = alpha - trading_cost_penalty - position_holding_penalty
+        rewards = torch.clamp(raw_reward * 100.0, -5.0, 5.0)
+
+        # Update tracking for next step
+        self.prev_spy_price = current_spy_price.clone()
+        self.prev_position = self.underlying_position.clone()
 
         # Update episode tracking
         self.episode_returns += rewards
@@ -412,30 +452,86 @@ class GPUOptionsEnvironment:
         return obs, rewards, terminated, truncated, {}
 
     def _execute_actions_gpu(self, actions: torch.Tensor, prices: torch.Tensor):
-        """Execute trading actions on GPU"""
-        # Action 0 = hold
-        # Actions 1-15 = buy options
-        # Actions 16-30 = sell options
+        """
+        Execute trading actions on GPU with proper position & cash accounting.
 
+        We simplify to trading the underlying (SPY) instead of options:
+          - Action 0      = HOLD
+          - Actions 1-15  = BUY underlying (SPY)
+          - Actions 16-30 = SELL underlying (SPY)
+
+        Key constraints:
+          - Can only BUY if we have enough capital
+          - Can only SELL if we have a position to sell
+        """
+        # Use SPY (symbol index 0) as the traded underlying
+        underlying_price = prices[:, 0]  # [n_envs]
+
+        # Masks
         buy_mask = (actions >= 1) & (actions <= 15)
         sell_mask = (actions >= 16) & (actions <= 30)
 
-        # Simple position updates (can be expanded)
-        # Buy: decrease capital, add position
+        # BUY logic: open/increase long position if we have enough cash
+        # Action 1-15 = buy 1-15 units
         if buy_mask.any():
-            buy_envs = buy_mask.nonzero(as_tuple=True)[0]
-            option_cost = prices[buy_envs, 0] * 0.02  # Simplified option pricing
-            self.capital[buy_envs] -= option_cost * 100  # 1 contract = 100 shares
+            envs = buy_mask.nonzero(as_tuple=True)[0]
+            requested_units = actions[envs].float()  # Actions 1-15 = buy 1-15 units
 
-        # Sell: increase capital
+            # Cost per unit
+            cost_per_unit = underlying_price[envs] * self.lot_size
+
+            # Calculate max affordable units for each env
+            max_affordable = torch.floor(self.capital[envs] / cost_per_unit)
+
+            # Buy as many as requested or affordable, whichever is smaller
+            units_to_buy = torch.minimum(requested_units, max_affordable)
+            units_to_buy = torch.clamp(units_to_buy, min=0.0)
+
+            # Only process envs that can buy at least 1 unit
+            can_buy = units_to_buy >= 1.0
+            if can_buy.any():
+                buy_envs = envs[can_buy]
+                buy_units = units_to_buy[can_buy]
+
+                # Deduct cash
+                self.capital[buy_envs] -= underlying_price[buy_envs] * self.lot_size * buy_units
+
+                # Increase position
+                self.underlying_position[buy_envs] += buy_units
+
+        # SELL logic: close/reduce long position only if we have units to sell
+        # Action 16-30 = sell 1-15 units
         if sell_mask.any():
-            sell_envs = sell_mask.nonzero(as_tuple=True)[0]
-            self.capital[sell_envs] += prices[sell_envs, 0] * 0.01 * 100
+            envs = sell_mask.nonzero(as_tuple=True)[0]
+            requested_units = (actions[envs] - 15).float()  # Actions 16-30 = sell 1-15 units
+
+            # Can only sell what we have
+            available_units = self.underlying_position[envs]
+            units_to_sell = torch.minimum(requested_units, available_units)
+            units_to_sell = torch.clamp(units_to_sell, min=0.0)
+
+            # Only process envs that can sell at least 1 unit
+            can_sell = units_to_sell >= 1.0
+            if can_sell.any():
+                sell_envs = envs[can_sell]
+                sell_units = units_to_sell[can_sell]
+
+                # Credit cash
+                self.capital[sell_envs] += underlying_price[sell_envs] * self.lot_size * sell_units
+
+                # Reduce position
+                self.underlying_position[sell_envs] -= sell_units
 
     def _update_portfolio_value_gpu(self, prices: torch.Tensor):
-        """Update portfolio value on GPU"""
-        # Simplified: value = capital + position values
-        self.portfolio_value = self.capital.clone()
+        """
+        Update portfolio value on GPU:
+          value = cash + mark-to-market of underlying position
+        """
+        underlying_price = prices[:, 0]  # SPY close
+
+        # Mark-to-market position value (using self.lot_size)
+        position_value = self.underlying_position * underlying_price * self.lot_size
+        self.portfolio_value = self.capital + position_value
 
     def _reset_done_envs(self, done_mask: torch.Tensor):
         """Reset specific environments that are done"""
@@ -449,15 +545,20 @@ class GPUOptionsEnvironment:
         self.portfolio_value[done_idx] = self.initial_capital
         self.positions[done_idx] = 0
         self.n_positions[done_idx] = 0
+        self.underlying_position[done_idx] = 0  # Reset underlying positions
         self.current_step[done_idx] = 0
         self.episode_returns[done_idx] = 0
         self.done[done_idx] = False
+        self.prev_position[done_idx] = 0  # Reset position tracking for reward
 
         # New random starting days
         max_start = max(0, self.n_days - self.episode_length - 1)
         self.current_day_idx[done_idx] = torch.randint(
             20, max_start + 20, (n_done,), device=self.device, dtype=torch.int64
         )
+
+        # Reset prev_spy_price for the new episode starting days
+        self.prev_spy_price[done_idx] = self.prices[self.current_day_idx[done_idx], 0, 3]
 
     def close(self):
         """Cleanup GPU memory"""
