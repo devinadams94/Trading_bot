@@ -275,6 +275,219 @@ python src/apps/train.py --timesteps 10000000
 
 ---
 
+---
+
+### 11. Mixed Precision Training (AMP)
+
+**Before:** All computations in FP32.
+
+**After:** Automatic Mixed Precision with `--amp` flag:
+- Forward/backward passes use FP16 (half precision)
+- Accumulation and optimizer steps use FP32 (full precision)
+- GradScaler prevents underflow in FP16 gradients
+
+**Why it's better:**
+- 1.5-2x speedup on modern GPUs (RTX 4090, 6000 Ada have excellent FP16 tensor cores)
+- Reduced memory bandwidth requirements
+- No accuracy loss due to FP32 accumulation
+
+**Usage:**
+```bash
+python src/apps/train.py --amp --high-vram --multi-gpu
+```
+
+---
+
+### 12. Factor-Based Portfolio Regimes (Scalable Action Space)
+
+**Before:** 16+ discrete portfolio regimes with hard-coded stock allocations. Didn't scale.
+
+**After:** 12 factor-based regimes that scale to any stock universe:
+
+| Idx | Name | Type | Description |
+|-----|------|------|-------------|
+| 0 | HOLD | hold | Keep current allocation |
+| 1 | FULL_CASH | cash | 100% cash |
+| 2 | DEFENSIVE | cash | 50% cash + 50% equal weight |
+| 3 | LIGHT_CASH | cash | 25% cash + 75% equal weight |
+| 4 | EQUAL_WEIGHT | factor | Equal weight all stocks |
+| 5 | MOMENTUM | factor | Overweight top 50% by 20-day momentum |
+| 6 | LOW_VOL | factor | Overweight top 50% by lowest volatility |
+| 7 | QUALITY | factor | Overweight top 50% by Sharpe ratio |
+| 8 | SIZE_SMALL | factor | Overweight smaller stocks |
+| 9 | SAFE_MOMENTUM | mixed | 30% cash + 70% momentum tilt |
+| 10 | SAFE_QUALITY | mixed | 30% cash + 70% quality tilt |
+| 11 | RISK_ON | mixed | 0% cash + aggressive momentum (top 30%) |
+
+**Factor scores computed dynamically:**
+- `momentum`: 20-day price change
+- `low_vol`: Inverse of 20-day volatility
+- `quality`: 20-day Sharpe ratio
+- `size`: Inverse of price (smaller stocks score higher)
+
+**Why it's better:**
+- Same 12 actions work for 3 stocks or 300 stocks
+- Agent learns **WHEN** to apply factors, not **WHICH stocks** to pick
+- Faster learning (simpler action space)
+- Factor weights adjust dynamically based on current market conditions
+
+---
+
+### 13. Environment Realism Improvements
+
+**Before:** Instant execution at close price with only transaction costs.
+
+**After:** Four realistic trading friction models:
+
+#### 13a. Slippage (0.05% max)
+```python
+slippage_pct = random(0, 0.0005)
+# Buying gets worse price (higher), selling gets worse price (lower)
+executed_price = close * (1 + slippage_pct)  # for buys
+executed_price = close * (1 - slippage_pct)  # for sells
+```
+
+#### 13b. Bid-Ask Spread (0.02%)
+```python
+spread_cost = 0.0002 * abs(delta_shares) * price
+```
+
+#### 13c. T-1 Prices for Observations
+```python
+# Agent sees yesterday's data, executes at today's prices
+obs_day_idx = day_idx - 1  # Observations from T-1
+execution_day_idx = day_idx  # Execution at T
+```
+
+#### 13d. Market Impact (sqrt model)
+```python
+relative_size = trade_value / portfolio_value
+impact_pct = 0.01 * sqrt(relative_size)
+impact_cost = impact_pct * trade_value
+```
+
+**Typical trading costs by regime:**
+| Regime | Cost |
+|--------|------|
+| HOLD | 0.00% |
+| FULL_CASH | 0.00% |
+| DEFENSIVE | ~0.06% |
+| LIGHT_CASH | ~0.56% |
+| EQUAL_WEIGHT | ~0.98% |
+| Factor strategies | 0.3-1.0% |
+
+**Why it's better:**
+- Model learns to avoid excessive turnover
+- Rewards are more realistic for paper/live trading
+- Prevents unrealistic strategies that only work with zero friction
+
+---
+
+### 14. Generalized Advantage Estimation (GAE)
+
+**Before:** Pure Monte Carlo returns (high variance).
+```python
+# Simple backward pass - high variance
+returns[t] = reward[t] + gamma * returns[t+1] * not_done
+advantages = returns - values
+```
+
+**After:** GAE with λ=0.95 (lower variance, same bias).
+```python
+# TD error
+delta = reward[t] + gamma * V(s_{t+1}) * not_done - V(s_t)
+# GAE with temporal smoothing
+gae = delta + gamma * lambda * not_done * gae
+advantages = gae
+returns = advantages + values
+```
+
+**GAE lambda controls bias-variance tradeoff:**
+| λ Value | Behavior |
+|---------|----------|
+| λ=1.0 | Pure MC (high variance, zero bias) |
+| λ=0.0 | TD(0) (low variance, high bias) |
+| λ=0.95 | Good balance (recommended) |
+
+**Why it's better:**
+- Lower variance advantage estimates
+- More stable policy updates
+- Configurable via `--gae-lambda 0.95`
+
+---
+
+### 15. Graceful Shutdown (Ctrl+C)
+
+**Before:** Ctrl+C killed training immediately without saving.
+
+**After:** Graceful shutdown with checkpoint save:
+1. First Ctrl+C: Sets flag, prints message, finishes current iteration
+2. Saves checkpoint as `model_interrupted_YYYYMMDD_HHMMSS.pt`
+3. Second Ctrl+C: Force quit (no save)
+
+**Checkpoint includes:**
+- Model weights
+- Actor optimizer state
+- Critic optimizer state
+- Total steps completed
+- Training metrics
+
+**Resume interrupted training:**
+```bash
+# Auto-find latest checkpoint
+python src/apps/train.py --resume
+
+# Or specify exact checkpoint
+python src/apps/train.py --checkpoint checkpoints/clstm_full/model_interrupted_20251205_123456.pt
+```
+
+**Why it's better:**
+- Never lose training progress
+- Safe to stop and resume anytime
+- Supports long training runs with interruptions
+
+---
+
+### 16. Fixed DataParallel Compatibility
+
+**Before:** `torch.inference_mode()` during rollout caused crash with multi-GPU DataParallel.
+```
+RuntimeError: Inference tensors cannot be saved for backward.
+```
+
+**After:** Use `torch.no_grad()` instead of `torch.inference_mode()`.
+
+**Why:**
+- `inference_mode()` creates "inference tensors" that can't be used in autograd
+- `no_grad()` disables gradient tracking but tensors can still be used as inputs
+- Both are fast, but `no_grad()` is compatible with DataParallel
+
+---
+
+## CLI Quick Reference (Updated)
+
+```bash
+# Full training with all optimizations
+python src/apps/train.py \
+  --config configs/rl_v2_multi_asset.yaml \
+  --high-vram \
+  --multi-gpu \
+  --amp \
+  --hidden-dim 256 \
+  --n-gru-layers 2 \
+  --critic-epochs 4 \
+  --gae-lambda 0.95 \
+  --episodes 1000
+
+# Resume interrupted training
+python src/apps/train.py --resume --high-vram --multi-gpu --amp
+
+# Quick test (10 episodes)
+python src/apps/train.py --episodes 10 --verbose
+```
+
+---
+
 ## Future Updates
 
 <!-- Add new updates below this line -->
